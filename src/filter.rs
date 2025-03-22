@@ -79,7 +79,6 @@ pub async fn run_event_filter(
                                         NotificationType::Quote => prefs.quotes,
                                     };
 
-// In run_event_filter, replace the current notification creation code with:
 if should_notify {
     // Create notification content with handle map and post resolver
     match create_notification_content(
@@ -679,11 +678,13 @@ async fn create_notification_content(
             )
         },
         NotificationType::Follow => {
-            // For follows, no post content needed
+            // For follows, create a profile URI for the follower
+            let profile_uri = format!("at://{}", event.author);
+            
             (
                 "New follower".to_string(),
                 format!("@{} followed you", username),
-                None
+                Some(profile_uri)  // Now includes URI for deep linking
             )
         }
     };
