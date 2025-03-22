@@ -49,7 +49,7 @@ pub struct NotificationPayload {
     pub notification_type: NotificationType,
     pub title: String,
     pub body: String,
-    pub data: HashMap<String, String>,
+    pub data: HashMap<String, String>, 
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

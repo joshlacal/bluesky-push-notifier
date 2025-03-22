@@ -1,7 +1,7 @@
 use anyhow::Result;
 use sqlx::{Pool, Postgres};
 use tokio::sync::mpsc;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use std::sync::Arc;
 use std::collections::HashMap;
 
@@ -10,13 +10,17 @@ use crate::{
     models::{BlueskyEvent, NotificationPayload, NotificationType},
 };
 
+use crate::post_resolver::PostResolver;
+
 pub async fn run_event_filter(
     mut event_receiver: mpsc::Receiver<BlueskyEvent>,
     notification_sender: mpsc::Sender<NotificationPayload>,
     db_pool: Pool<Postgres>,
     did_resolver: Arc<crate::did_resolver::DidResolver>,
+    post_resolver: Arc<crate::post_resolver::PostResolver>,
 ) -> Result<()> {
     info!("Starting event filter");
+
 
     // Cache of registered users to avoid frequent DB lookups
     let mut registered_users = db::get_registered_users(&db_pool).await?;
@@ -75,29 +79,44 @@ pub async fn run_event_filter(
                                         NotificationType::Quote => prefs.quotes,
                                     };
 
-                                    if should_notify {
-                                        // Create notification content with handle map
-                                        let (title, body) = create_notification_content(
-                                            &handle_map,
-                                            &notification_type, 
-                                            &event
-                                        );
+// In run_event_filter, replace the current notification creation code with:
+if should_notify {
+    // Create notification content with handle map and post resolver
+    match create_notification_content(
+        &handle_map,
+        &notification_type, 
+        &event,
+        &post_resolver
+    ).await {
+        Ok((title, body, uri)) => {
+            // Prepare notification payload with additional data
+            let mut data = HashMap::new();
+            
+            // Add URI to data for deep linking
+            if let Some(uri_str) = &uri {
+                data.insert("uri".to_string(), uri_str.clone());
+                data.insert("type".to_string(), format!("{:?}", notification_type));
+            }
 
-                                        // Prepare notification payload
-                                        let payload = NotificationPayload {
-                                            user_did: did.clone(),
-                                            device_token: device.device_token.clone(),
-                                            notification_type: notification_type.clone(),
-                                            title,
-                                            body,
-                                            data: Default::default(), // Add relevant data as needed
-                                        };
+            let payload = NotificationPayload {
+                user_did: did.clone(),
+                device_token: device.device_token.clone(),
+                notification_type: notification_type.clone(),
+                title,
+                body,
+                data, // Now contains URI and type for deep linking
+            };
 
-                                        // Send to notification queue
-                                        if let Err(e) = notification_sender.send(payload).await {
-                                            error!("Failed to send notification to queue: {}", e);
-                                        }
-                                    }
+            // Send to notification queue
+            if let Err(e) = notification_sender.send(payload).await {
+                error!("Failed to send notification to queue: {}", e);
+            }
+        },
+        Err(e) => {
+            error!("Failed to create notification content: {}", e);
+        }
+    }
+}
                                 }
                                 Err(e) => {
                                     error!("Failed to get notification preferences: {}", e);
@@ -537,50 +556,146 @@ fn extract_target_dids(event: &BlueskyEvent, registered_users: &[String]) -> Vec
     Vec::new()
 }
 
-fn create_notification_content(
+async fn create_notification_content(
     handle_map: &HashMap<String, String>,
     notification_type: &NotificationType,
     event: &BlueskyEvent,
-) -> (String, String) {
+    post_resolver: &PostResolver,
+) -> Result<(String, String, Option<String>)> {
     // Use resolved handle if available, fallback to DID
     let username = handle_map.get(&event.author)
         .cloned()
         .unwrap_or_else(|| event.author.split(':').last().unwrap_or(&event.author).to_string());
-
-    let (title, body) = match notification_type {
-        NotificationType::Mention => (
-            "New mention".to_string(),
-            format!("@{} mentioned you in a post", username),
-        ),
-        NotificationType::Reply => (
-            "New reply".to_string(),
-            format!("@{} replied to your post", username),
-        ),
-        NotificationType::Like => (
-            "New like".to_string(),
-            format!("@{} liked your post", username),
-        ),
-        NotificationType::Follow => (
-            "New follower".to_string(),
-            format!("@{} followed you", username),
-        ),
-        NotificationType::Repost => (
-            "New repost".to_string(),
-            format!("@{} reposted your post", username),
-        ),
-        NotificationType::Quote => (
-            "New quote".to_string(),
-            format!("@{} quoted your post", username),
-        ),
+    
+    // Extract URI and appropriate content based on notification type
+    let (title, body, uri) = match notification_type {
+        NotificationType::Like => {
+            // For likes, we need to fetch the content of the post that was liked
+            if let Some(subject) = event.record.get("subject").and_then(|s| s.as_object()) {
+                if let Some(uri) = subject.get("uri").and_then(|u| u.as_str()) {
+                    // Fetch the original post content that was liked
+                    match post_resolver.get_post_content(uri).await {
+                        Ok(content) => (
+                            format!("@{} liked your post", username),
+                            content,
+                            Some(uri.to_string())
+                        ),
+                        Err(e) => {
+                            warn!(error = %e, "Failed to get original post content for like");
+                            (
+                                format!("@{} liked your post", username),
+                                "".to_string(),
+                                Some(uri.to_string())
+                            )
+                        }
+                    }
+                } else {
+                    (
+                        format!("@{} liked your post", username),
+                        "".to_string(),
+                        None
+                    )
+                }
+            } else {
+                (
+                    format!("@{} liked your post", username),
+                    "".to_string(),
+                    None
+                )
+            }
+        },
+        NotificationType::Repost => {
+            // For reposts, we need to fetch the content of the post that was reposted
+            if let Some(subject) = event.record.get("subject").and_then(|s| s.as_object()) {
+                if let Some(uri) = subject.get("uri").and_then(|u| u.as_str()) {
+                    // Fetch the original post content that was reposted
+                    match post_resolver.get_post_content(uri).await {
+                        Ok(content) => (
+                            format!("@{} reposted your post", username),
+                            content,
+                            Some(uri.to_string())
+                        ),
+                        Err(e) => {
+                            warn!(error = %e, "Failed to get original post content for repost");
+                            (
+                                format!("@{} reposted your post", username),
+                                "".to_string(),
+                                Some(uri.to_string())
+                            )
+                        }
+                    }
+                } else {
+                    (
+                        format!("@{} reposted your post", username),
+                        "".to_string(),
+                        None
+                    )
+                }
+            } else {
+                (
+                    format!("@{} reposted your post", username),
+                    "".to_string(),
+                    None
+                )
+            }
+        },
+        NotificationType::Reply => {
+            // For replies, use the text of the reply itself
+            let post_text = event.record.get("text").and_then(|t| t.as_str()).unwrap_or("");
+            let uri = format!("at://{}/app.bsky.feed.post/{}", 
+                event.author, 
+                event.path.split('/').last().unwrap_or(""));
+                
+            (
+                format!("@{} replied to you", username),
+                post_text.to_string(),
+                Some(uri)
+            )
+        },
+        NotificationType::Mention => {
+            // For mentions, use the text of the mentioning post
+            let post_text = event.record.get("text").and_then(|t| t.as_str()).unwrap_or("");
+            let uri = format!("at://{}/app.bsky.feed.post/{}", 
+                event.author, 
+                event.path.split('/').last().unwrap_or(""));
+                
+            (
+                format!("@{} mentioned you", username),
+                post_text.to_string(),
+                Some(uri)
+            )
+        },
+        NotificationType::Quote => {
+            // For quotes, use the text of the quoting post
+            let post_text = event.record.get("text").and_then(|t| t.as_str()).unwrap_or("");
+            let uri = format!("at://{}/app.bsky.feed.post/{}", 
+                event.author, 
+                event.path.split('/').last().unwrap_or(""));
+                
+            (
+                format!("@{} quoted your post", username),
+                post_text.to_string(),
+                Some(uri)
+            )
+        },
+        NotificationType::Follow => {
+            // For follows, no post content needed
+            (
+                "New follower".to_string(),
+                format!("@{} followed you", username),
+                None
+            )
+        }
     };
-
+    
     tracing::debug!(
         notification_type = ?notification_type,
         username = %username,
         title = %title,
         body = %body,
+        uri = ?uri,
         "Created notification content"
     );
 
-    (title, body)
+    Ok((title, body, uri))
 }

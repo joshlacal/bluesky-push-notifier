@@ -9,6 +9,7 @@ mod models;
 mod stream;
 mod subscription;
 mod did_resolver;
+mod post_resolver;
 
 use anyhow::Result;
 use std::sync::Arc;
@@ -47,6 +48,26 @@ async fn main() -> Result<()> {
         }
     });
 
+    // After initializing did_resolver
+let post_resolver = Arc::new(post_resolver::PostResolver::new(
+    db_pool.clone(),
+    60, // 60 minute TTL
+    std::env::var("BSKY_API_URL").unwrap_or_else(|_| "https://public.api.bsky.app".to_string())
+));
+
+// Start post_resolver cleanup task
+let post_resolver_clone = post_resolver.clone();
+tokio::spawn(async move {
+    let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(3600)); // hourly
+    loop {
+        interval.tick().await;
+        if let Err(e) = post_resolver_clone.cleanup_expired().await {
+            tracing::error!("Error cleaning up post cache: {}", e);
+        }
+    }
+});
+
+
     // Initialize APNs client
     let apns_client = apns::ApnsClient::new(
         &config.apns_key_path,
@@ -70,13 +91,13 @@ async fn main() -> Result<()> {
         shutdown_rx,
     ));
 
-    // Spawn event filter task - Pass did_resolver as the 4th argument
-    let filter_handle = tokio::spawn(filter::run_event_filter(
-        event_receiver,
-        notification_sender,
-        db_pool.clone(),
-        did_resolver.clone(),
-    ));
+let filter_handle = tokio::spawn(filter::run_event_filter(
+    event_receiver,
+    notification_sender,
+    db_pool.clone(),
+    did_resolver.clone(),
+    post_resolver.clone(), 
+));
 
     // Spawn notification sender task
     let apns_handle = tokio::spawn(apns::run_notification_sender(
