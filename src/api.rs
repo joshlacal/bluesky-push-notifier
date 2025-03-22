@@ -1,5 +1,7 @@
 use axum::{
-    extract::{Json, Query},
+    extract::{Json, Query, State},
+    http::{header, StatusCode},
+    response::IntoResponse,
     routing::{get, post, put},
     Router,
 };
@@ -7,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Postgres};
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
+use tracing::error;
 
 use crate::models::{NotificationPreference, UserDevice};
 
@@ -44,6 +47,8 @@ pub fn create_api_router(state: Arc<ApiState>) -> Router {
         .route("/register", post(register_device))
         .route("/preferences", get(get_preferences))
         .route("/preferences", put(update_preferences))
+        .route("/health", get(health_check))       // Add health check endpoint
+        .route("/metrics", get(metrics_endpoint))  // Add metrics endpoint
         .with_state(state)
         .layer(CorsLayer::permissive()) // For development - restrict in production
 }
@@ -299,4 +304,27 @@ async fn update_preferences(
         Ok(None) => axum::http::StatusCode::NOT_FOUND,
         Err(_) => axum::http::StatusCode::INTERNAL_SERVER_ERROR,
     }
+}
+
+// Add health check handler
+async fn health_check(
+    State(state): State<Arc<ApiState>>,
+) -> impl IntoResponse {
+    // Check DB connection
+    match sqlx::query("SELECT 1").fetch_one(&state.db_pool).await {
+        Ok(_) => (StatusCode::OK, "Healthy"),
+        Err(e) => {
+            error!("Health check failed: {}", e);
+            (StatusCode::SERVICE_UNAVAILABLE, "Unhealthy: Database issue")
+        }
+    }
+}
+
+// Add metrics endpoint handler
+async fn metrics_endpoint() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/plain")],
+        crate::metrics::metrics_handler(),
+    )
 }

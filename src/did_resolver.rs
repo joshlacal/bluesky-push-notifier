@@ -255,6 +255,7 @@ impl DidResolver {
                 if let Some(cached) = cache.get(did) {
                     if cached.expires_at > Instant::now() {
                         result.insert(did.clone(), cached.handle.clone());
+                        crate::metrics::DID_CACHE_HITS.inc();
                     }
                 }
             }
@@ -273,8 +274,10 @@ impl DidResolver {
         // 3. Try database cache for missing DIDs
         if let Ok(db_results) = self.get_from_db_cache_bulk(&missing_dids).await {
             for (did, doc, handle) in db_results {
-                self.update_memory_cache(did.clone(), doc, handle.clone()).await;
-                result.insert(did, handle);
+                result.insert(did.clone(), handle.clone());
+                // Update memory cache
+                self.update_memory_cache(did, doc, handle).await;
+                crate::metrics::DID_CACHE_HITS.inc();
             }
         }
         
@@ -288,53 +291,51 @@ impl DidResolver {
             return result;
         }
         
-        // 5. Resolve remaining DIDs with limited concurrency
-        // Use a semaphore to limit concurrent network requests
+        // 5. Resolve remaining DIDs with limited concurrency using JoinSet
         let semaphore = Arc::new(tokio::sync::Semaphore::new(5));
+        let mut set = tokio::task::JoinSet::new();
         
-        let resolver = Arc::new(self.clone());
+        // Track how many DIDs we need to resolve via network
+        crate::metrics::DID_CACHE_MISSES.inc_by(still_missing.len() as f64);
         
-        let resolves = still_missing.into_iter().map(|did| {
+        for did in still_missing {
             let sem = semaphore.clone();
-            let resolver = resolver.clone();
-            let did_clone = did.clone();
+            let resolver = self.clone();
             
-            async move {
+            set.spawn(async move {
+                // Create a timer to measure resolution time
+                let timer = std::time::Instant::now();
+                
+                // Acquire permit to limit concurrency
                 let _permit = sem.acquire().await.unwrap();
-                match resolver.resolve_did_network(&did_clone).await {
+                match resolver.resolve_did_network(&did).await {
                     Ok((doc, handle)) => {
-                        // Update caches asynchronously (fire and forget)
-                        let resolver_clone = resolver.clone();
-                        let doc_clone = doc.clone();
-                        let handle_clone = handle.clone();
-                        let did_clone2 = did_clone.clone(); // Clone for the closure
+                        // Record resolution time
+                        let elapsed = timer.elapsed().as_secs_f64();
+                        crate::metrics::DID_RESOLUTION_TIME.observe(elapsed);
                         
-                        tokio::spawn(async move {
-                            // Clone did_clone2 again before passing to update_caches
-                            let did_for_cache = did_clone2.clone();
-                            let did_for_warning = did_clone2;
-                            
-                            if let Err(e) = resolver_clone.update_caches(did_for_cache, doc_clone, handle_clone).await {
-                                warn!(did = %did_for_warning, error = %e, "Failed to update DID caches");
-                            }
-                        });
-                        Some((did_clone, handle))
+                        Some((did, doc, handle))
                     },
                     Err(e) => {
-                        warn!(did = %did_clone, error = %e, "Failed to resolve DID");
-                        let fallback = did_to_fallback_handle(&did_clone);
-                        Some((did_clone, fallback))
+                        warn!("Failed to resolve DID {}: {}", did, e);
+                        None
                     }
                 }
+            });
+        }
+        
+        // Collect results as they complete
+        while let Some(join_result) = set.join_next().await {
+            if let Ok(Some((did, doc, handle))) = join_result {
+                result.insert(did.clone(), handle.clone());
+                // Also update caches asynchronously for future use
+                let resolver = self.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = resolver.update_caches(did, doc, handle).await {
+                        warn!("Failed to update caches: {}", e);
+                    }
+                });
             }
-        });
-        
-        // Wait for all resolutions to complete
-        let network_results = futures::future::join_all(resolves).await;
-        
-        // Add network results to final map
-        for item in network_results.into_iter().flatten() {
-            result.insert(item.0, item.1);
         }
         
         result

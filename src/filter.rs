@@ -21,12 +21,15 @@ pub async fn run_event_filter(
 ) -> Result<()> {
     info!("Starting event filter");
 
-
     // Cache of registered users to avoid frequent DB lookups
     let mut registered_users = db::get_registered_users(&db_pool).await?;
     let mut last_cache_refresh = std::time::Instant::now();
 
     while let Some(event) = event_receiver.recv().await {
+        // Create timer to measure event processing time
+        let timer = std::time::Instant::now();
+        crate::metrics::EVENTS_PROCESSED.inc();
+        
         // Refresh user cache every 5 minutes
         if last_cache_refresh.elapsed().as_secs() > 300 {
             match db::get_registered_users(&db_pool).await {
@@ -61,12 +64,32 @@ pub async fn run_event_filter(
             // Resolve all handles at once
             let handle_map = did_resolver.get_handles_bulk(&dids_to_resolve).await;
             
-            for did in relevant_dids {
-                // Get user devices
-                match db::get_user_devices(&db_pool, &did).await {
-                    Ok(devices) => {
-                        for device in devices {
-                            // Get user notification preferences
+            // Fetch devices for all relevant DIDs in one batch operation
+            let devices_map = match db::get_user_devices_batch(&db_pool, &relevant_dids).await {
+                Ok(map) => map,
+                Err(e) => {
+                    error!("Failed to batch fetch user devices: {}", e);
+                    continue; // Skip to next event
+                }
+            };
+
+            // Process each relevant DID
+            let mut notification_futures = Vec::new();
+            for did in &relevant_dids {
+                if let Some(devices) = devices_map.get(did) {
+                    // Process devices for this DID
+                    for device in devices {
+                        let db_pool = db_pool.clone();
+                        let device = device.clone();
+                        let notification_type = notification_type.clone();
+                        let event = event.clone();
+                        let handle_map = handle_map.clone();
+                        let post_resolver = post_resolver.clone();
+                        let notification_sender = notification_sender.clone();
+                        let did = did.clone();
+                        
+                        notification_futures.push(async move {
+                            // Get user preferences
                             match db::get_notification_preferences(&db_pool, device.id).await {
                                 Ok(prefs) => {
                                     // Check if user wants this notification type
@@ -79,56 +102,89 @@ pub async fn run_event_filter(
                                         NotificationType::Quote => prefs.quotes,
                                     };
 
-if should_notify {
-    // Create notification content with handle map and post resolver
-    match create_notification_content(
-        &handle_map,
-        &notification_type, 
-        &event,
-        &post_resolver
-    ).await {
-        Ok((title, body, uri)) => {
-            // Prepare notification payload with additional data
-            let mut data = HashMap::new();
-            
-            // Add URI to data for deep linking
-            if let Some(uri_str) = &uri {
-                data.insert("uri".to_string(), uri_str.clone());
-                data.insert("type".to_string(), format!("{:?}", notification_type));
-            }
+                                    if should_notify {
+                                        // Create notification content with handle map and post resolver
+                                        match create_notification_content(
+                                            &handle_map,
+                                            &notification_type, 
+                                            &event,
+                                            &post_resolver
+                                        ).await {
+                                            Ok((title, body, uri)) => {
+                                                // Prepare notification payload with additional data
+                                                let mut data = HashMap::new();
+                                                
+                                                // Add URI to data for deep linking
+                                                if let Some(uri_str) = &uri {
+                                                    data.insert("uri".to_string(), uri_str.clone());
+                                                    data.insert("type".to_string(), format!("{:?}", notification_type));
+                                                }
 
-            let payload = NotificationPayload {
-                user_did: did.clone(),
-                device_token: device.device_token.clone(),
-                notification_type: notification_type.clone(),
-                title,
-                body,
-                data, // Now contains URI and type for deep linking
-            };
+                                                let payload = NotificationPayload {
+                                                    user_did: did.clone(),
+                                                    device_token: device.device_token.clone(),
+                                                    notification_type: notification_type.clone(),
+                                                    title,
+                                                    body,
+                                                    data, // Now contains URI and type for deep linking
+                                                };
 
-            // Send to notification queue
-            if let Err(e) = notification_sender.send(payload).await {
-                error!("Failed to send notification to queue: {}", e);
-            }
-        },
-        Err(e) => {
-            error!("Failed to create notification content: {}", e);
-        }
-    }
-}
-                                }
+                                                // Add backpressure detection
+                                                let remaining_capacity = notification_sender.capacity();
+                                                if remaining_capacity == 0 {
+                                                    warn!(
+                                                        "Notification channel at capacity, applying backpressure for {} notification",
+                                                        format!("{:?}", notification_type).to_lowercase()
+                                                    );
+                                                    
+                                                    // Prioritize important notifications
+                                                    if !matches!(notification_type, NotificationType::Follow | NotificationType::Reply | NotificationType::Mention) {
+                                                        warn!("Skipping low-priority notification due to system load");
+                                                        return;
+                                                    }
+                                                    
+                                                    // Brief delay to allow system to catch up
+                                                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                                                }
+
+                                                // Send with timeout to avoid blocking indefinitely
+                                                match tokio::time::timeout(
+                                                    tokio::time::Duration::from_secs(3),
+                                                    notification_sender.send(payload)
+                                                ).await {
+                                                    Ok(Ok(_)) => {
+                                                        crate::metrics::NOTIFICATIONS_SENT.inc();
+                                                    },
+                                                    Ok(Err(e)) => {
+                                                        error!("Failed to send notification to queue: {}", e);
+                                                    },
+                                                    Err(_) => {
+                                                        error!("Timeout when sending notification to queue - system overloaded");
+                                                    }
+                                                }
+                                            },
+                                            Err(e) => {
+                                                error!("Failed to create notification content: {}", e);
+                                            }
+                                        }
+                                    }
+                                },
                                 Err(e) => {
                                     error!("Failed to get notification preferences: {}", e);
                                 }
                             }
-                        }
-                    }
-                    Err(e) => {
-                        error!("Failed to get user devices: {}", e);
+                        });
                     }
                 }
             }
+            
+            // Execute all notification processing in parallel
+            futures::future::join_all(notification_futures).await;
         }
+        
+        // Record event processing time
+        let elapsed = timer.elapsed().as_secs_f64();
+        crate::metrics::EVENT_PROCESSING_TIME.observe(elapsed);
     }
 
     info!("Event filter stopped");
