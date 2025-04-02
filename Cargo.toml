@@ -28,9 +28,12 @@ ipld-core = { version = "0.4.2", default-features = false, features = ["std"] }
 chrono = "0.4.40"
 trait-variant = "0.1.2"
 axum = "0.7"
-tower-http = { version = "0.5", features = ["cors"] }
+tower-http = { version = "0.5", features = ["cors", "limit"] }
 reqwest = { version = "0.12.15", features = ["json"] }
 num_cpus = "1.16"
 prometheus = "0.13"
 lazy_static = "1.4"
 circuit_breaker = "0.1.1"
+moka = { version = "0.11", features = ["future"] }
+constant_time_eq = "0.2"
+tower = { version = "0.5", features = ["limit"] }

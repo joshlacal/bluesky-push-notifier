@@ -18,6 +18,7 @@ pub async fn run_event_filter(
     db_pool: Pool<Postgres>,
     did_resolver: Arc<crate::did_resolver::DidResolver>,
     post_resolver: Arc<crate::post_resolver::PostResolver>,
+    relationship_manager: Arc<crate::relationship_manager::RelationshipManager>,
 ) -> Result<()> {
     info!("Starting event filter");
 
@@ -76,6 +77,25 @@ pub async fn run_event_filter(
             // Process each relevant DID
             let mut notification_futures = Vec::new();
             for did in &relevant_dids {
+                // Check if the target has muted or blocked the author
+                if relationship_manager.is_muted(did, &event.author).await {
+                    debug!(
+                        recipient = %did,
+                        author = %event.author,
+                        "Skipping notification - author is muted by recipient"
+                    );
+                    continue;
+                }
+                
+                if relationship_manager.is_blocked(did, &event.author).await {
+                    debug!(
+                        recipient = %did,
+                        author = %event.author,
+                        "Skipping notification - author is blocked by recipient"
+                    );
+                    continue;
+                }
+                
                 if let Some(devices) = devices_map.get(did) {
                     // Process devices for this DID
                     for device in devices {

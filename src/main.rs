@@ -11,6 +11,7 @@ mod subscription;
 mod did_resolver;
 mod post_resolver;
 mod metrics;
+mod relationship_manager;
 
 use anyhow::Result;
 use std::sync::Arc;
@@ -19,6 +20,7 @@ use tokio::{
     sync::{mpsc, oneshot},
 };
 use tracing::info;
+use relationship_manager::RelationshipManager;
 
 fn main() -> Result<()> {
     // Build custom runtime with explicit thread configuration
@@ -49,6 +51,21 @@ fn main() -> Result<()> {
 
         // Initialize database connection pool
         let db_pool = db::init_db_pool(&config.database_url).await?;
+
+        // Initialize relationship manager with moka cache
+        let relationship_manager = Arc::new(RelationshipManager::new(db_pool.clone()));
+
+        // Start background task for relationship cache maintenance
+        let relationship_manager_clone = relationship_manager.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(3600)); // hourly
+            loop {
+                interval.tick().await;
+                if let Err(e) = relationship_manager_clone.run_cache_maintenance().await {
+                    tracing::error!("Error during relationship cache maintenance: {}", e);
+                }
+            }
+        });
 
         let did_resolver = Arc::new(did_resolver::DidResolver::new(db_pool.clone(), 24));
 
@@ -110,7 +127,8 @@ fn main() -> Result<()> {
             notification_sender,
             db_pool.clone(),
             did_resolver.clone(),
-            post_resolver.clone(), 
+            post_resolver.clone(),
+            relationship_manager.clone(), // Add relationship manager
         ));
 
         // Spawn notification sender task
@@ -124,6 +142,7 @@ fn main() -> Result<()> {
         let db_pool_clone = db_pool.clone();
         let api_state = Arc::new(api::ApiState {
             db_pool: db_pool_clone,
+            relationship_manager: relationship_manager.clone(), // Add relationship manager
         });
         let api_router = api::create_api_router(api_state);
 

@@ -1,17 +1,24 @@
 use axum::{
+    error_handling::HandleErrorLayer, // Add HandleErrorLayer
     extract::{Json, Query, State},
     http::{header, StatusCode},
     response::IntoResponse,
     routing::{get, post, put},
+    BoxError, // Add BoxError for error handler
     Router,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Postgres};
 use std::sync::Arc;
+use std::time::Duration;
 use tower_http::cors::CorsLayer;
-use tracing::error;
+// Remove unused import: tower_http::limit::RequestBodyLimitLayer
+use tower::timeout::TimeoutLayer;
+use tower::ServiceBuilder;
+use tracing::{error, info, warn};
 
 use crate::models::{NotificationPreference, UserDevice};
+use crate::relationship_manager::RelationshipManager;
 
 // Request and response models
 #[derive(Deserialize)]
@@ -36,21 +43,109 @@ struct PreferencesRequest {
     quotes: bool,
 }
 
+// New model for relationship updates with authentication
+#[derive(Deserialize)]
+struct RelationshipsRequest {
+    did: String,
+    device_token: String, // Required for authentication
+    mutes: Vec<String>,
+    blocks: Vec<String>,
+}
+
 // API state
 pub struct ApiState {
     pub db_pool: Pool<Postgres>,
+    pub relationship_manager: Arc<RelationshipManager>,
 }
 
-// Set up API router
+// Add error handler function for timeouts
+async fn handle_timeout_error(error: BoxError) -> (StatusCode, String) {
+    if error.is::<tower::timeout::error::Elapsed>() {
+        (
+            StatusCode::REQUEST_TIMEOUT,
+            "Request took too long".to_string(),
+        )
+    } else {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Unhandled internal error: {}", error),
+        )
+    }
+}
+
 pub fn create_api_router(state: Arc<ApiState>) -> Router {
     Router::new()
         .route("/register", post(register_device))
         .route("/preferences", get(get_preferences))
         .route("/preferences", put(update_preferences))
-        .route("/health", get(health_check))       // Add health check endpoint
-        .route("/metrics", get(metrics_endpoint))  // Add metrics endpoint
+        .route("/health", get(health_check))
+        .route("/metrics", get(metrics_endpoint))
+        .route("/relationships", put(update_relationships))
         .with_state(state)
-        .layer(CorsLayer::permissive()) // For development - restrict in production
+        // Properly structure middleware stack
+        .layer(
+            ServiceBuilder::new()
+                // Handle errors from TimeoutLayer
+                .layer(HandleErrorLayer::new(handle_timeout_error))
+                // Apply the timeout
+                .layer(TimeoutLayer::new(Duration::from_secs(30)))
+                // Apply CORS
+                .layer(CorsLayer::permissive()),
+        )
+}
+
+// Handler for the new relationships endpoint
+async fn update_relationships(
+    State(state): State<Arc<ApiState>>,
+    Json(req): Json<RelationshipsRequest>,
+) -> impl IntoResponse {
+    info!(
+        "Processing relationship update request for DID: {}",
+        req.did
+    );
+
+    // Verify request size limits to prevent abuse
+    if req.mutes.len() > 1000 || req.blocks.len() > 1000 {
+        warn!(
+            "Excessive relationship data: mutes={}, blocks={}",
+            req.mutes.len(),
+            req.blocks.len()
+        );
+        return (
+            StatusCode::BAD_REQUEST,
+            "Request exceeds maximum allowable size",
+        )
+            .into_response();
+    }
+
+    match state
+        .relationship_manager
+        .update_relationships_batch(&req.did, &req.device_token, req.mutes, req.blocks)
+        .await
+    {
+        Ok(_) => {
+            info!("Successfully updated relationships for DID: {}", req.did);
+            StatusCode::OK.into_response()
+        }
+        Err(e) => {
+            if e.to_string().contains("Invalid device token") {
+                // Authentication error
+                warn!(
+                    "Unauthorized relationship update attempt for DID: {}",
+                    req.did
+                );
+                StatusCode::UNAUTHORIZED.into_response()
+            } else {
+                // Other errors - provide more information in the response
+                error!("Error updating relationships: {}", e);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Internal server error: {}", e),
+                )
+                    .into_response()
+            }
+        }
+    }
 }
 
 // API handlers
@@ -59,7 +154,7 @@ async fn register_device(
     Json(req): Json<RegisterRequest>,
 ) -> axum::response::Response {
     tracing::info!("Registering device for DID: {}", req.did);
-    
+
     // Start a transaction to prevent race conditions
     let mut tx = match state.db_pool.begin().await {
         Ok(tx) => tx,
@@ -121,7 +216,7 @@ async fn register_device(
                                 .body(axum::body::Body::from(format!("Database error: {}", e)))
                                 .unwrap();
                         }
-                        
+
                         tracing::info!("Device token updated successfully");
                         return axum::response::Response::builder()
                             .status(200)
@@ -165,7 +260,8 @@ async fn register_device(
                         row.id
                     )
                     .execute(&mut *tx)
-                    .await {
+                    .await
+                    {
                         Ok(_) => {
                             // Commit transaction
                             if let Err(e) = tx.commit().await {
@@ -175,7 +271,7 @@ async fn register_device(
                                     .body(axum::body::Body::from(format!("Database error: {}", e)))
                                     .unwrap();
                             }
-                            
+
                             tracing::info!("Device registered successfully");
                             return axum::response::Response::builder()
                                 .status(201)
@@ -307,9 +403,7 @@ async fn update_preferences(
 }
 
 // Add health check handler
-async fn health_check(
-    State(state): State<Arc<ApiState>>,
-) -> impl IntoResponse {
+async fn health_check(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
     // Check DB connection
     match sqlx::query("SELECT 1").fetch_one(&state.db_pool).await {
         Ok(_) => (StatusCode::OK, "Healthy"),
