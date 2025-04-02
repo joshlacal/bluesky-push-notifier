@@ -90,7 +90,7 @@ pub fn create_api_router(state: Arc<ApiState>) -> Router {
                 // Apply the timeout
                 .layer(TimeoutLayer::new(Duration::from_secs(30)))
                 // Apply CORS
-                .layer(CorsLayer::permissive()),
+                // .layer(CorsLayer::permissive()),
         )
 }
 

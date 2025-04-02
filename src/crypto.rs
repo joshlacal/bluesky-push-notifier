@@ -4,19 +4,15 @@ use std::env;
 
 // Provides utilities for hashing DIDs to protect privacy
 pub struct CryptoUtils {
-    server_secret: String,
+    pub server_secret: String,
 }
 
 impl CryptoUtils {
     // Create a new CryptoUtils instance, loading the server secret from environment
     pub fn new() -> Result<Self> {
         let server_secret = env::var("SERVER_ENCRYPTION_SECRET")
-            .unwrap_or_else(|_| {
-                // Fallback to a default, but warn - this should be set in production
-                tracing::warn!("SERVER_ENCRYPTION_SECRET not set! Using fallback secret. This is insecure in production.");
-                "fallback_secret_CHANGE_ME_in_production_4738291".to_string()
-            });
-
+        .expect("SERVER_ENCRYPTION_SECRET environment variable must be set");
+    
         Ok(Self { server_secret })
     }
 

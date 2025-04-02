@@ -68,11 +68,12 @@ impl RelationshipManager {
             match sqlx::query!(
                 r#"
                 SELECT COUNT(*) as count 
-                FROM user_mutes_hashed 
-                WHERE user_did = $1 AND muted_did_hash = $2
+                FROM user_mutes_encrypted 
+                WHERE user_did = $1 AND muted_did_encrypted = pgp_sym_encrypt($2, $3)
                 "#,
                 user_did,
-                target_hash
+                target_hash,
+                self.crypto.server_secret
             )
             .fetch_one(&self.db_pool)
             .await {
@@ -110,11 +111,12 @@ impl RelationshipManager {
             match sqlx::query!(
                 r#"
                 SELECT COUNT(*) as count 
-                FROM user_blocks_hashed 
-                WHERE user_did = $1 AND blocked_did_hash = $2
+                FROM user_blocks_encrypted 
+                WHERE user_did = $1 AND blocked_did_encrypted = pgp_sym_encrypt($2, $3)
                 "#,
                 user_did,
-                target_hash
+                target_hash,
+                self.crypto.server_secret
             )
             .fetch_one(&self.db_pool)
             .await {
@@ -195,16 +197,18 @@ impl RelationshipManager {
         // 3. We keep both tables synchronized during updates
         let rows = sqlx::query!(
             r#"
-            SELECT muted_did FROM user_mutes
-            WHERE user_did = $1
+            SELECT pgp_sym_decrypt(muted_did_encrypted, $1) as muted_did 
+            FROM user_mutes_encrypted
+            WHERE user_did = $2
             "#,
+            self.crypto.server_secret,
             user_did
         )
         .fetch_all(&self.db_pool)
         .await
         .context("Failed to fetch user mutes")?;
 
-        let mutes: HashSet<String> = rows.into_iter().map(|row| row.muted_did).collect();
+        let mutes: HashSet<String> = rows.into_iter().map(|row| row.muted_did.unwrap_or_default()).collect();
         Ok(mutes)
     }
 
@@ -230,16 +234,18 @@ impl RelationshipManager {
         // Similar to mutes, fall back to plaintext for now
         let rows = sqlx::query!(
             r#"
-            SELECT blocked_did FROM user_blocks
-            WHERE user_did = $1
+            SELECT pgp_sym_decrypt(blocked_did_encrypted, $1) as blocked_did
+            FROM user_blocks_encrypted
+            WHERE user_did = $2
             "#,
+            self.crypto.server_secret,
             user_did
         )
         .fetch_all(&self.db_pool)
         .await
         .context("Failed to fetch user blocks")?;
 
-        let blocks: HashSet<String> = rows.into_iter().map(|row| row.blocked_did).collect();
+        let blocks: HashSet<String> = rows.into_iter().map(|row| row.blocked_did.unwrap_or_default()).collect();
         Ok(blocks)
     }
 
@@ -418,12 +424,12 @@ impl RelationshipManager {
         blocks: &[String],
     ) -> Result<()> {
         // Clear existing hashed relationships
-        sqlx::query!("DELETE FROM user_mutes_hashed WHERE user_did = $1", user_did)
+        sqlx::query!("DELETE FROM user_mutes_encrypted WHERE user_did = $1", user_did)
             .execute(&mut **tx)
             .await
             .context("Failed to delete existing hashed mutes")?;
 
-        sqlx::query!("DELETE FROM user_blocks_hashed WHERE user_did = $1", user_did)
+        sqlx::query!("DELETE FROM user_blocks_encrypted WHERE user_did = $1", user_did)
             .execute(&mut **tx)
             .await
             .context("Failed to delete existing hashed blocks")?;
@@ -474,7 +480,7 @@ impl RelationshipManager {
                 .context("Failed to batch insert plaintext mute relationships")?;
 
             // Insert into hashed table for privacy
-            let mut query_builder = String::from("INSERT INTO user_mutes_hashed (user_did, muted_did_hash) VALUES ");
+            let mut query_builder = String::from("INSERT INTO user_mutes_encrypted (user_did, muted_did_encrypted) VALUES ");
             let mut params = Vec::new();
             let mut param_idx = 1;
 
@@ -482,10 +488,11 @@ impl RelationshipManager {
                 if i > 0 {
                     query_builder.push_str(", ");
                 }
-                query_builder.push_str(&format!("(${},${})", param_idx, param_idx + 1));
+                query_builder.push_str(&format!("(${}, pgp_sym_encrypt(${}, ${}))", param_idx, param_idx + 1, param_idx + 2));
                 params.push(user_did.to_string());
                 params.push(muted_did_hash.clone());
-                param_idx += 2;
+                params.push(self.crypto.server_secret.clone());
+                param_idx += 3;
             }
 
             let query = sqlx::query(&query_builder);
@@ -523,7 +530,7 @@ impl RelationshipManager {
                 .context("Failed to batch insert plaintext block relationships")?;
 
             // Insert into hashed table for privacy
-            let mut query_builder = String::from("INSERT INTO user_blocks_hashed (user_did, blocked_did_hash) VALUES ");
+            let mut query_builder = String::from("INSERT INTO user_blocks_encrypted (user_did, blocked_did_encrypted) VALUES ");
             let mut params = Vec::new();
             let mut param_idx = 1;
 
@@ -531,10 +538,11 @@ impl RelationshipManager {
                 if i > 0 {
                     query_builder.push_str(", ");
                 }
-                query_builder.push_str(&format!("(${},${})", param_idx, param_idx + 1));
+                query_builder.push_str(&format!("(${}, pgp_sym_encrypt(${}, ${}))", param_idx, param_idx + 1, param_idx + 2));
                 params.push(user_did.to_string());
                 params.push(blocked_did_hash.clone());
-                param_idx += 2;
+                params.push(self.crypto.server_secret.clone());
+                param_idx += 3;
             }
 
             let query = sqlx::query(&query_builder);
