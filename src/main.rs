@@ -1,6 +1,7 @@
 mod api;
 mod apns;
 mod config;
+mod crypto; // Add the new crypto module
 mod db;
 mod filter;
 mod firehose;

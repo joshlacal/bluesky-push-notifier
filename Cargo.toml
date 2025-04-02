@@ -37,3 +37,4 @@ circuit_breaker = "0.1.1"
 moka = { version = "0.11", features = ["future"] }
 constant_time_eq = "0.2"
 tower = { version = "0.5", features = ["limit"] }
+sha2 = "0.10.8"  # Add this dependency for SHA-256 hashing
