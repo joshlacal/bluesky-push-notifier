@@ -358,46 +358,53 @@ async fn update_preferences(
     axum::extract::State(state): axum::extract::State<Arc<ApiState>>,
     Json(req): Json<PreferencesRequest>,
 ) -> axum::http::StatusCode {
-    // Find user device
-    let device = sqlx::query_as!(
+    // Find ALL user devices for this DID (remove the LIMIT 1)
+    let devices = sqlx::query_as!(
         UserDevice,
         r#"
         SELECT id, did, device_token, created_at, updated_at
         FROM user_devices
         WHERE did = $1
-        LIMIT 1
         "#,
         req.did,
     )
-    .fetch_optional(&state.db_pool)
+    .fetch_all(&state.db_pool)
     .await;
 
-    match device {
-        Ok(Some(device)) => {
-            // Update preferences
-            let result = sqlx::query!(
-                r#"
-                UPDATE notification_preferences
-                SET mentions = $1, replies = $2, likes = $3, follows = $4, reposts = $5, quotes = $6
-                WHERE user_id = $7
-                "#,
-                req.mentions,
-                req.replies,
-                req.likes,
-                req.follows,
-                req.reposts,
-                req.quotes,
-                device.id
-            )
-            .execute(&state.db_pool)
-            .await;
-
-            match result {
-                Ok(_) => axum::http::StatusCode::OK,
-                Err(_) => axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+    match devices {
+        Ok(devices) if !devices.is_empty() => {
+            // Update preferences for ALL devices associated with this DID
+            let mut success = true;
+            for device in devices {
+                let result = sqlx::query!(
+                    r#"
+                    UPDATE notification_preferences
+                    SET mentions = $1, replies = $2, likes = $3, follows = $4, reposts = $5, quotes = $6
+                    WHERE user_id = $7
+                    "#,
+                    req.mentions,
+                    req.replies,
+                    req.likes,
+                    req.follows,
+                    req.reposts,
+                    req.quotes,
+                    device.id
+                )
+                .execute(&state.db_pool)
+                .await;
+                
+                if result.is_err() {
+                    success = false;
+                }
             }
-        }
-        Ok(None) => axum::http::StatusCode::NOT_FOUND,
+            
+            if success {
+                axum::http::StatusCode::OK
+            } else {
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR
+            }
+        },
+        Ok(_) => axum::http::StatusCode::NOT_FOUND,
         Err(_) => axum::http::StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
