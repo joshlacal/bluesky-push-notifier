@@ -133,15 +133,37 @@ pub async fn get_last_cursor(pool: &Pool<Postgres>) -> Result<Option<String>> {
 }
 
 pub async fn update_cursor(pool: &Pool<Postgres>, cursor: &str) -> Result<()> {
-    sqlx::query!(
-        r#"
-        INSERT INTO firehose_cursor (cursor, updated_at)
-        VALUES ($1, NOW())
-        "#,
-        cursor
-    )
-    .execute(pool)
-    .await?;
+    // Check if a cursor exists
+    let exists = sqlx::query!("SELECT COUNT(*) as count FROM firehose_cursor")
+        .fetch_one(pool)
+        .await?
+        .count
+        .unwrap_or(0) > 0;
+
+    if exists {
+        // Update existing cursor
+        sqlx::query!(
+            r#"
+            UPDATE firehose_cursor
+            SET cursor = $1, updated_at = NOW()
+            WHERE id = (SELECT id FROM firehose_cursor ORDER BY id DESC LIMIT 1)
+            "#,
+            cursor
+        )
+        .execute(pool)
+        .await?;
+    } else {
+        // Insert new cursor if none exists
+        sqlx::query!(
+            r#"
+            INSERT INTO firehose_cursor (cursor, updated_at)
+            VALUES ($1, NOW())
+            "#,
+            cursor
+        )
+        .execute(pool)
+        .await?;
+    }
 
     Ok(())
 }

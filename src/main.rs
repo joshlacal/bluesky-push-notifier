@@ -56,6 +56,12 @@ fn main() -> Result<()> {
         // Initialize relationship manager with moka cache
         let relationship_manager = Arc::new(RelationshipManager::new(db_pool.clone()));
 
+        // One-time cleanup to fix existing cursor issue
+info!("Running one-time cleanup of firehose cursor table");
+if let Err(e) = db::cleanup_old_cursors(&db_pool, 1).await {
+    error!("Error during one-time cursor cleanup: {}", e);
+}
+
         // Start background task for relationship cache maintenance
         let relationship_manager_clone = relationship_manager.clone();
         tokio::spawn(async move {
@@ -64,6 +70,19 @@ fn main() -> Result<()> {
                 interval.tick().await;
                 if let Err(e) = relationship_manager_clone.run_cache_maintenance().await {
                     tracing::error!("Error during relationship cache maintenance: {}", e);
+                }
+            }
+        });
+
+                // Spawn cursor cleanup task
+        let db_pool_clone = db_pool.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(3600)); // hourly
+            loop {
+                interval.tick().await;
+                // Keep only 1 day of history
+                if let Err(e) = db::cleanup_old_cursors(&db_pool_clone, 1).await {
+                    tracing::error!("Error cleaning up cursor history: {}", e);
                 }
             }
         });
