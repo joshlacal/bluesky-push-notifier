@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE firehose_cursor\n            SET cursor = $1, updated_at = NOW()\n            WHERE id = (SELECT id FROM firehose_cursor ORDER BY id DESC LIMIT 1)\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "d38a6510a65a913a793c74042ddd32c26e0024f986a709e431449fae95719292"
+}

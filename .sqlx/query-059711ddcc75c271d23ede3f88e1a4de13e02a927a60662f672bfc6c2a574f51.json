@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        DELETE FROM firehose_cursor\n        WHERE updated_at < NOW() - INTERVAL '1 day' * $1\n        AND id NOT IN (SELECT id FROM firehose_cursor ORDER BY updated_at DESC LIMIT 1)\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Float8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "059711ddcc75c271d23ede3f88e1a4de13e02a927a60662f672bfc6c2a574f51"
+}

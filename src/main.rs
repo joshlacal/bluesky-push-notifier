@@ -14,6 +14,7 @@ mod post_resolver;
 mod metrics;
 mod relationship_manager;
 
+use tracing::error;
 use anyhow::Result;
 use std::sync::Arc;
 use tokio::{

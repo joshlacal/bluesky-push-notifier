@@ -1,0 +1,58 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT user_id, mentions, replies, likes, follows, reposts, quotes\n        FROM notification_preferences\n        WHERE user_id = $1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "user_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "mentions",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 2,
+        "name": "replies",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 3,
+        "name": "likes",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 4,
+        "name": "follows",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 5,
+        "name": "reposts",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 6,
+        "name": "quotes",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "331d9bdde54cb2f977816ce8580767e93366782fb8bb3548938efae1063f484f"
+}

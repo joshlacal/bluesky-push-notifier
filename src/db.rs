@@ -1,13 +1,13 @@
 use anyhow::Result;
 use sqlx::{postgres::PgPoolOptions, Pool, Postgres, Row};
-use tracing::info;
 use std::collections::HashMap;
+use tracing::info;
 
 use crate::models::{FirehoseCursor, NotificationPreference, UserDevice};
 
 pub async fn init_db_pool(database_url: &str) -> Result<Pool<Postgres>> {
     info!("Initializing database connection pool");
-    
+
     // Calculate optimal connection count based on CPU cores
     let max_connections = std::env::var("DATABASE_MAX_CONNECTIONS")
         .ok()
@@ -16,9 +16,12 @@ pub async fn init_db_pool(database_url: &str) -> Result<Pool<Postgres>> {
             let cores = num_cpus::get() as u32;
             cores * 2 + 1 // Common formula for connection pools
         });
-    
-    info!("Setting database pool to {} max connections", max_connections);
-    
+
+    info!(
+        "Setting database pool to {} max connections",
+        max_connections
+    );
+
     let pool = PgPoolOptions::new()
         .max_connections(max_connections)
         .connect(database_url)
@@ -47,38 +50,36 @@ pub async fn get_user_devices(pool: &Pool<Postgres>, did: &str) -> Result<Vec<Us
 }
 
 pub async fn get_user_devices_batch(
-    pool: &Pool<Postgres>, 
-    dids: &[String]
+    pool: &Pool<Postgres>,
+    dids: &[String],
 ) -> Result<HashMap<String, Vec<UserDevice>>> {
     if dids.is_empty() {
         return Ok(HashMap::new());
     }
-    
+
     let mut result = HashMap::new();
-    
+
     // Process in chunks to avoid too many parameters
     for chunk in dids.chunks(10) {
         // Create placeholders for SQL IN clause
-        let placeholders: Vec<String> = (1..=chunk.len())
-            .map(|i| format!("${}", i))
-            .collect();
-        
+        let placeholders: Vec<String> = (1..=chunk.len()).map(|i| format!("${}", i)).collect();
+
         let query = format!(
             "SELECT id, did, device_token, created_at, updated_at 
              FROM user_devices 
              WHERE did IN ({})",
             placeholders.join(",")
         );
-        
+
         // Manually build and execute the query
         let mut q = sqlx::query(&query);
         for did in chunk {
             q = q.bind(did);
         }
-        
+
         // Execute the query and process rows
         let rows = q.fetch_all(pool).await?;
-        
+
         for row in rows {
             let device = UserDevice {
                 id: row.get("id"),
@@ -87,13 +88,14 @@ pub async fn get_user_devices_batch(
                 created_at: row.get("created_at"),
                 updated_at: row.get("updated_at"),
             };
-            
-            result.entry(device.did.clone())
+
+            result
+                .entry(device.did.clone())
                 .or_insert_with(Vec::new)
                 .push(device);
         }
     }
-    
+
     Ok(result)
 }
 
@@ -138,7 +140,8 @@ pub async fn update_cursor(pool: &Pool<Postgres>, cursor: &str) -> Result<()> {
         .fetch_one(pool)
         .await?
         .count
-        .unwrap_or(0) > 0;
+        .unwrap_or(0)
+        > 0;
 
     if exists {
         // Update existing cursor
@@ -181,4 +184,19 @@ pub async fn get_registered_users(pool: &Pool<Postgres>) -> Result<Vec<String>> 
     .collect();
 
     Ok(users)
+}
+
+pub async fn cleanup_old_cursors(pool: &Pool<Postgres>, days_to_keep: i32) -> Result<()> {
+    sqlx::query!(
+        r#"
+        DELETE FROM firehose_cursor
+        WHERE updated_at < NOW() - INTERVAL '1 day' * $1
+        AND id NOT IN (SELECT id FROM firehose_cursor ORDER BY updated_at DESC LIMIT 1)
+        "#,
+        days_to_keep as f64
+    )
+    .execute(pool)
+    .await?;
+
+    Ok(())
 }

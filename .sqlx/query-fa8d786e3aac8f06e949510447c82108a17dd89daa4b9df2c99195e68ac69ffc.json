@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM user_mutes_encrypted WHERE user_did = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "fa8d786e3aac8f06e949510447c82108a17dd89daa4b9df2c99195e68ac69ffc"
+}

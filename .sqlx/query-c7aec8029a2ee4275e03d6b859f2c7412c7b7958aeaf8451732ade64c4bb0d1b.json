@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO post_cache (uri, text, expires_at)\n            VALUES ($1, $2, $3)\n            ON CONFLICT (uri) DO UPDATE\n            SET text = $2, expires_at = $3\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "c7aec8029a2ee4275e03d6b859f2c7412c7b7958aeaf8451732ade64c4bb0d1b"
+}

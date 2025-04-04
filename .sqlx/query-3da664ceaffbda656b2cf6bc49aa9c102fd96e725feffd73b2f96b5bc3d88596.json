@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO did_cache (did, document, handle, expires_at)\n            VALUES ($1, $2, $3, $4)\n            ON CONFLICT (did) DO UPDATE\n            SET document = $2, handle = $3, expires_at = $4\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Jsonb",
+        "Text",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "3da664ceaffbda656b2cf6bc49aa9c102fd96e725feffd73b2f96b5bc3d88596"
+}

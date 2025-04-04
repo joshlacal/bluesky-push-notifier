@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT DISTINCT user_did FROM user_mutes",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "user_did",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "34541ecb3160870d7f14b56976623e052266c27a9f21297934cdb9c0c3dfd1df"
+}

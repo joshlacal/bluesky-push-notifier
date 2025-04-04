@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                        INSERT INTO notification_preferences (user_id)\n                        VALUES ($1)\n                        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "6dcddd6fc0f34ab399d277c53071f948f7eb5ce1e473719d815ba764f2b0f5c2"
+}

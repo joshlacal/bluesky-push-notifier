@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT pgp_sym_decrypt(blocked_did_encrypted, $1) as blocked_did\n            FROM user_blocks_encrypted\n            WHERE user_did = $2\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "blocked_did",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "a3b87194bfde15ac66798db31e48c090a2c687f1908f2eefa08dca5db1527f6f"
+}

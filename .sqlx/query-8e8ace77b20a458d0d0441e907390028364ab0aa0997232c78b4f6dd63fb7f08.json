@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                    UPDATE user_devices\n                    SET did = $1, updated_at = NOW()\n                    WHERE device_token = $2\n                    ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "8e8ace77b20a458d0d0441e907390028364ab0aa0997232c78b4f6dd63fb7f08"
+}

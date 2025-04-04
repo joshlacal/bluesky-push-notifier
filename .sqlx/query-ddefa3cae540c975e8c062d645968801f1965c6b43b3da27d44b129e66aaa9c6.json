@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM user_blocks_encrypted WHERE user_did = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "ddefa3cae540c975e8c062d645968801f1965c6b43b3da27d44b129e66aaa9c6"
+}
