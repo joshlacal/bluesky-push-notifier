@@ -77,6 +77,15 @@ pub async fn run_event_filter(
             // Process each relevant DID
             let mut notification_futures = Vec::new();
             for did in &relevant_dids {
+                // Add this check to skip self-notifications
+                if did == &event.author {
+                    debug!(
+                        recipient = %did,
+                        "Skipping self-notification"
+                    );
+                    continue;
+                }
+
                 // Check if the target has muted or blocked the author
                 if relationship_manager.is_muted(did, &event.author).await {
                     debug!(
