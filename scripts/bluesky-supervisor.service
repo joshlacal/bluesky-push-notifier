@@ -1,0 +1,18 @@
+[Unit]
+Description=Bluesky Push Notifier Health Supervisor
+After=bluesky-push-notifier.service
+Requires=bluesky-push-notifier.service
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+ExecStart=/home/ubuntu/bluesky-push-notifier/scripts/health-supervisor.sh
+Restart=always
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=bluesky-supervisor
+
+[Install]
+WantedBy=multi-user.target

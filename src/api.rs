@@ -11,8 +11,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Postgres};
 use std::sync::Arc;
 use std::time::Duration;
-use tower_http::cors::CorsLayer;
-// Remove unused import: tower_http::limit::RequestBodyLimitLayer
+// Remove unused imports: tower_http::cors::CorsLayer, tower_http::limit::RequestBodyLimitLayer
 use tower::timeout::TimeoutLayer;
 use tower::ServiceBuilder;
 use tracing::{error, info, warn};
@@ -24,6 +23,11 @@ use crate::relationship_manager::RelationshipManager;
 #[derive(Deserialize)]
 struct RegisterRequest {
     did: String,
+    device_token: String,
+}
+
+#[derive(Deserialize)]
+struct UnregisterRequest {
     device_token: String,
 }
 
@@ -76,6 +80,7 @@ async fn handle_timeout_error(error: BoxError) -> (StatusCode, String) {
 pub fn create_api_router(state: Arc<ApiState>) -> Router {
     Router::new()
         .route("/register", post(register_device))
+        .route("/unregister", post(unregister_device))
         .route("/preferences", get(get_preferences))
         .route("/preferences", put(update_preferences))
         .route("/health", get(health_check))
@@ -308,6 +313,108 @@ async fn register_device(
         }
     }
 }
+
+async fn unregister_device(
+    axum::extract::State(state): axum::extract::State<Arc<ApiState>>,
+    Json(req): Json<UnregisterRequest>,
+) -> axum::response::Response {
+    tracing::info!("Unregistering device with token: {}...", &req.device_token[..8]);
+
+    // Start a transaction to ensure consistency
+    let mut tx = match state.db_pool.begin().await {
+        Ok(tx) => tx,
+        Err(e) => {
+            tracing::error!("Error starting transaction: {}", e);
+            return axum::response::Response::builder()
+                .status(500)
+                .body(axum::body::Body::from(format!("Database error: {}", e)))
+                .unwrap();
+        }
+    };
+
+    // Find the device to delete
+    let device_result = sqlx::query_as!(
+        UserDevice,
+        r#"
+        SELECT id, did, device_token, created_at, updated_at
+        FROM user_devices
+        WHERE device_token = $1
+        FOR UPDATE
+        "#,
+        req.device_token
+    )
+    .fetch_optional(&mut *tx)
+    .await;
+
+    match device_result {
+        Ok(Some(device)) => {
+            tracing::info!("Found device for DID: {}, proceeding with deletion", device.did);
+            
+            // Delete the device (this will cascade delete notification preferences)
+            let delete_result = sqlx::query!(
+                "DELETE FROM user_devices WHERE device_token = $1",
+                req.device_token
+            )
+            .execute(&mut *tx)
+            .await;
+
+            match delete_result {
+                Ok(result) => {
+                    if result.rows_affected() > 0 {
+                        // Commit transaction
+                        if let Err(e) = tx.commit().await {
+                            tracing::error!("Error committing transaction: {}", e);
+                            return axum::response::Response::builder()
+                                .status(500)
+                                .body(axum::body::Body::from(format!("Database error: {}", e)))
+                                .unwrap();
+                        }
+                        
+                        tracing::info!("Device unregistered successfully");
+                        axum::response::Response::builder()
+                            .status(200)
+                            .body(axum::body::Body::empty())
+                            .unwrap()
+                    } else {
+                        // This shouldn't happen since we found the device above, but handle it gracefully
+                        let _ = tx.rollback().await;
+                        tracing::warn!("Device not found during deletion");
+                        axum::response::Response::builder()
+                            .status(404)
+                            .body(axum::body::Body::from("Device not found"))
+                            .unwrap()
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.rollback().await;
+                    tracing::error!("Error deleting device: {}", e);
+                    axum::response::Response::builder()
+                        .status(500)
+                        .body(axum::body::Body::from(format!("Database error: {}", e)))
+                        .unwrap()
+                }
+            }
+        }
+        Ok(None) => {
+            // Device not found - return 200 OK as per requirements
+            let _ = tx.commit().await;
+            tracing::info!("Device token not found, returning 200 OK");
+            axum::response::Response::builder()
+                .status(200)
+                .body(axum::body::Body::empty())
+                .unwrap()
+        }
+        Err(e) => {
+            let _ = tx.rollback().await;
+            tracing::error!("Database error during device lookup: {}", e);
+            axum::response::Response::builder()
+                .status(500)
+                .body(axum::body::Body::from(format!("Database error: {}", e)))
+                .unwrap()
+        }
+    }
+}
+
 async fn get_preferences(
     axum::extract::State(state): axum::extract::State<Arc<ApiState>>,
     Query(query): Query<PreferencesQuery>,
