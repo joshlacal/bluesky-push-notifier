@@ -173,10 +173,11 @@ pub async fn run_notification_sender(
                 if let Some(a2_err) = e.downcast_ref::<a2::Error>() {
                     if let a2::Error::ResponseError(resp) = a2_err {
                         if resp.code == 410 {
-                            match sqlx::query!(
-                                "DELETE FROM user_devices WHERE device_token = $1",
-                                notification.device_token
+                            match sqlx::query(
+                                "DELETE FROM user_devices WHERE device_token = $1 AND did = $2",
                             )
+                            .bind(&notification.device_token)
+                            .bind(&notification.user_did)
                             .execute(&db_pool)
                             .await
                             {

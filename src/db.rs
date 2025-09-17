@@ -34,15 +34,21 @@ pub async fn init_db_pool(database_url: &str) -> Result<Pool<Postgres>> {
 }
 
 pub async fn get_user_devices(pool: &Pool<Postgres>, did: &str) -> Result<Vec<UserDevice>> {
-    let devices = sqlx::query_as!(
-        UserDevice,
+    let devices = sqlx::query_as::<_, UserDevice>(
         r#"
-        SELECT id, did, device_token, created_at, updated_at
+        SELECT id, did, device_token, created_at, updated_at,
+               app_attest_key_id,
+               app_attest_public_key,
+               app_attest_receipt,
+               app_attest_counter,
+               app_attest_challenge,
+               app_attest_challenge_expires_at,
+               app_attest_last_verified_at
         FROM user_devices
         WHERE did = $1
         "#,
-        did
     )
+    .bind(did)
     .fetch_all(pool)
     .await?;
 
@@ -65,7 +71,14 @@ pub async fn get_user_devices_batch(
         let placeholders: Vec<String> = (1..=chunk.len()).map(|i| format!("${}", i)).collect();
 
         let query = format!(
-            "SELECT id, did, device_token, created_at, updated_at 
+            "SELECT id, did, device_token, created_at, updated_at,
+                    app_attest_key_id,
+                    app_attest_public_key,
+                    app_attest_receipt,
+                    app_attest_counter,
+                    app_attest_challenge,
+                    app_attest_challenge_expires_at,
+                    app_attest_last_verified_at 
              FROM user_devices 
              WHERE did IN ({})",
             placeholders.join(",")
@@ -87,6 +100,13 @@ pub async fn get_user_devices_batch(
                 device_token: row.get("device_token"),
                 created_at: row.get("created_at"),
                 updated_at: row.get("updated_at"),
+                app_attest_key_id: row.get("app_attest_key_id"),
+                app_attest_public_key: row.get("app_attest_public_key"),
+                app_attest_receipt: row.get("app_attest_receipt"),
+                app_attest_counter: row.get::<i64, _>("app_attest_counter"),
+                app_attest_challenge: row.get("app_attest_challenge"),
+                app_attest_challenge_expires_at: row.get("app_attest_challenge_expires_at"),
+                app_attest_last_verified_at: row.get("app_attest_last_verified_at"),
             };
 
             result
@@ -103,15 +123,14 @@ pub async fn get_notification_preferences(
     pool: &Pool<Postgres>,
     user_id: uuid::Uuid,
 ) -> Result<NotificationPreference> {
-    let preferences = sqlx::query_as!(
-        NotificationPreference,
+    let preferences = sqlx::query_as::<_, NotificationPreference>(
         r#"
         SELECT user_id, mentions, replies, likes, follows, reposts, quotes
         FROM notification_preferences
         WHERE user_id = $1
         "#,
-        user_id
     )
+    .bind(user_id)
     .fetch_one(pool)
     .await?;
 
@@ -119,14 +138,13 @@ pub async fn get_notification_preferences(
 }
 
 pub async fn get_last_cursor(pool: &Pool<Postgres>) -> Result<Option<String>> {
-    let cursor = sqlx::query_as!(
-        FirehoseCursor,
+    let cursor = sqlx::query_as::<_, FirehoseCursor>(
         r#"
         SELECT id, cursor, updated_at
         FROM firehose_cursor
         ORDER BY id DESC
         LIMIT 1
-        "#
+        "#,
     )
     .fetch_optional(pool)
     .await?;

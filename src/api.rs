@@ -11,33 +11,70 @@ use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Postgres};
 use std::sync::Arc;
 use std::time::Duration;
+use time::OffsetDateTime;
 // Remove unused imports: tower_http::cors::CorsLayer, tower_http::limit::RequestBodyLimitLayer
 use tower::timeout::TimeoutLayer;
 use tower::ServiceBuilder;
 use tracing::{error, info, warn};
 
+use crate::app_attest::AppAttestService;
 use crate::models::{NotificationPreference, UserDevice};
 use crate::relationship_manager::RelationshipManager;
 
 // Request and response models
 #[derive(Deserialize)]
+struct AppAttestProof {
+    #[serde(rename = "app_attest_key_id")]
+    key_id: String,
+    #[serde(rename = "app_attest_assertion")]
+    assertion: String,
+    #[serde(rename = "app_attest_client_data")]
+    client_data: String,
+    #[serde(rename = "app_attest_challenge")]
+    challenge: String,
+}
+
+#[derive(Deserialize)]
 struct RegisterRequest {
     did: String,
     device_token: String,
+    #[serde(flatten)]
+    proof: AppAttestProof,
+    app_attest_attestation: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct UnregisterRequest {
+    did: String,
     device_token: String,
+    #[serde(flatten)]
+    proof: AppAttestProof,
 }
 
 #[derive(Deserialize)]
 struct PreferencesQuery {
     did: String,
+    device_token: String,
+    #[serde(flatten)]
+    proof: AppAttestProof,
 }
 
-#[derive(Deserialize, Serialize)]
-struct PreferencesRequest {
+#[derive(Deserialize)]
+struct PreferencesUpdateRequest {
+    did: String,
+    device_token: String,
+    #[serde(flatten)]
+    proof: AppAttestProof,
+    mentions: bool,
+    replies: bool,
+    likes: bool,
+    follows: bool,
+    reposts: bool,
+    quotes: bool,
+}
+
+#[derive(Serialize)]
+struct PreferencesBody {
     did: String,
     mentions: bool,
     replies: bool,
@@ -47,6 +84,27 @@ struct PreferencesRequest {
     quotes: bool,
 }
 
+#[derive(Serialize)]
+struct ChallengeEnvelope {
+    challenge: String,
+    expires_at: OffsetDateTime,
+}
+
+#[derive(Serialize)]
+struct RegisterResponse {
+    next_challenge: ChallengeEnvelope,
+}
+
+#[derive(Serialize)]
+struct PreferencesResponse {
+    preferences: PreferencesBody,
+    next_challenge: ChallengeEnvelope,
+}
+
+fn error_response(status: StatusCode, message: impl Into<String>) -> axum::response::Response {
+    (status, message.into()).into_response()
+}
+
 // New model for relationship updates with authentication
 #[derive(Deserialize)]
 struct RelationshipsRequest {
@@ -54,12 +112,15 @@ struct RelationshipsRequest {
     device_token: String, // Required for authentication
     mutes: Vec<String>,
     blocks: Vec<String>,
+    #[serde(flatten)]
+    proof: AppAttestProof,
 }
 
 // API state
 pub struct ApiState {
     pub db_pool: Pool<Postgres>,
     pub relationship_manager: Arc<RelationshipManager>,
+    pub app_attest: Arc<AppAttestService>,
 }
 
 // Add error handler function for timeouts
@@ -93,9 +154,8 @@ pub fn create_api_router(state: Arc<ApiState>) -> Router {
                 // Handle errors from TimeoutLayer
                 .layer(HandleErrorLayer::new(handle_timeout_error))
                 // Apply the timeout
-                .layer(TimeoutLayer::new(Duration::from_secs(30)))
-                // Apply CORS
-                // .layer(CorsLayer::permissive()),
+                .layer(TimeoutLayer::new(Duration::from_secs(30))), // Apply CORS
+                                                                    // .layer(CorsLayer::permissive()),
         )
 }
 
@@ -123,14 +183,162 @@ async fn update_relationships(
             .into_response();
     }
 
+    let mut tx = match state.db_pool.begin().await {
+        Ok(tx) => tx,
+        Err(e) => {
+            tracing::error!("Failed to start transaction for relationship update: {}", e);
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "database error");
+        }
+    };
+
+    let device = match sqlx::query_as::<_, UserDevice>(
+        r#"
+        SELECT id, did, device_token, created_at, updated_at,
+               app_attest_key_id,
+               app_attest_public_key,
+               app_attest_receipt,
+               app_attest_counter,
+               app_attest_challenge,
+               app_attest_challenge_expires_at,
+               app_attest_last_verified_at
+        FROM user_devices
+        WHERE device_token = $1 AND did = $2
+        FOR UPDATE
+        "#,
+    )
+    .bind(&req.device_token)
+    .bind(&req.did)
+    .fetch_optional(&mut *tx)
+    .await
+    {
+        Ok(Some(device)) => device,
+        Ok(None) => {
+            tx.rollback().await.ok();
+            return error_response(StatusCode::NOT_FOUND, "device not registered");
+        }
+        Err(e) => {
+            tx.rollback().await.ok();
+            tracing::error!("Failed to fetch device for relationship update: {}", e);
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "database error");
+        }
+    };
+
+    if let Some(key_id) = &device.app_attest_key_id {
+        if key_id != &req.proof.key_id {
+            tx.rollback().await.ok();
+            return error_response(StatusCode::UNAUTHORIZED, "app attest key mismatch");
+        }
+    } else {
+        tx.rollback().await.ok();
+        return error_response(
+            StatusCode::PRECONDITION_REQUIRED,
+            "device requires re-attestation",
+        );
+    }
+
+    if let Err(err) = state.app_attest.validate_challenge(
+        device.app_attest_challenge.as_deref(),
+        device.app_attest_challenge_expires_at,
+        &req.proof.challenge,
+    ) {
+        tx.rollback().await.ok();
+        tracing::warn!(
+            "Challenge validation failed for relationship update on DID {}: {}",
+            req.did,
+            err
+        );
+        return error_response(StatusCode::UNAUTHORIZED, "invalid or expired challenge");
+    }
+
+    let public_key = match &device.app_attest_public_key {
+        Some(key) => key.clone(),
+        None => {
+            tx.rollback().await.ok();
+            return error_response(
+                StatusCode::PRECONDITION_REQUIRED,
+                "device requires re-attestation",
+            );
+        }
+    };
+
+    let previous_counter = match u32::try_from(device.app_attest_counter) {
+        Ok(value) => value,
+        Err(_) => {
+            tx.rollback().await.ok();
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "invalid counter state");
+        }
+    };
+
+    let assertion = match state.app_attest.verify_assertion(
+        &req.proof.assertion,
+        &req.proof.client_data,
+        &public_key,
+        previous_counter,
+        device.app_attest_challenge.as_deref(),
+        &req.proof.challenge,
+    ) {
+        Ok(result) => result,
+        Err(err) => {
+            tx.rollback().await.ok();
+            tracing::warn!(
+                "App Attest assertion failed for relationship update on DID {}: {}",
+                req.did,
+                err
+            );
+            return error_response(StatusCode::UNAUTHORIZED, "invalid app attest assertion");
+        }
+    };
+
+    let (next_challenge, expires_at) = state.app_attest.issue_challenge();
+
+    if let Err(e) = sqlx::query(
+        r#"
+        UPDATE user_devices
+        SET app_attest_counter = $1,
+            app_attest_challenge = $2,
+            app_attest_challenge_expires_at = $3,
+            app_attest_last_verified_at = NOW(),
+            updated_at = NOW()
+        WHERE id = $4
+        "#,
+    )
+    .bind(i64::from(assertion.counter))
+    .bind(&next_challenge)
+    .bind(expires_at)
+    .bind(device.id)
+    .execute(&mut *tx)
+    .await
+    {
+        tx.rollback().await.ok();
+        tracing::error!(
+            "Failed to update device metadata during relationship update: {}",
+            e
+        );
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR, "database error");
+    }
+
+    if let Err(e) = tx.commit().await {
+        tracing::error!("Failed to commit device challenge update: {}", e);
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR, "database error");
+    }
+
+    let mutes = req.mutes.clone();
+    let blocks = req.blocks.clone();
+
     match state
         .relationship_manager
-        .update_relationships_batch(&req.did, &req.device_token, req.mutes, req.blocks)
+        .update_relationships_batch(&req.did, &req.device_token, mutes, blocks)
         .await
     {
         Ok(_) => {
             info!("Successfully updated relationships for DID: {}", req.did);
-            StatusCode::OK.into_response()
+            let response = RegisterResponse {
+                next_challenge: ChallengeEnvelope {
+                    challenge: next_challenge,
+                    expires_at,
+                },
+            };
+            (StatusCode::OK, Json(response)).into_response()
         }
         Err(e) => {
             if e.to_string().contains("Invalid device token") {
@@ -160,165 +368,292 @@ async fn register_device(
 ) -> axum::response::Response {
     tracing::info!("Registering device for DID: {}", req.did);
 
-    // Start a transaction to prevent race conditions
     let mut tx = match state.db_pool.begin().await {
         Ok(tx) => tx,
         Err(e) => {
             tracing::error!("Error starting transaction: {}", e);
-            return axum::response::Response::builder()
-                .status(500)
-                .body(axum::body::Body::from(format!("Database error: {}", e)))
-                .unwrap();
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Database error: {}", e),
+            );
         }
     };
 
-    // Check for existing token within the transaction
-    let existing_token = sqlx::query_as!(
-        UserDevice,
+    let existing_registration = match sqlx::query_as::<_, UserDevice>(
         r#"
-        SELECT id, did, device_token, created_at, updated_at
+        SELECT id, did, device_token, created_at, updated_at,
+               app_attest_key_id,
+               app_attest_public_key,
+               app_attest_receipt,
+               app_attest_counter,
+               app_attest_challenge,
+               app_attest_challenge_expires_at,
+               app_attest_last_verified_at
         FROM user_devices
-        WHERE device_token = $1
+        WHERE device_token = $1 AND did = $2
         FOR UPDATE
         "#,
-        req.device_token
     )
+    .bind(&req.device_token)
+    .bind(&req.did)
     .fetch_optional(&mut *tx)
-    .await;
-
-    match existing_token {
-        Ok(Some(device)) => {
-            if device.did == req.did {
-                // Device already registered with this DID - return success
-                let _ = tx.commit().await;
-                tracing::info!("Device already registered with same DID");
-                return axum::response::Response::builder()
-                    .status(200)
-                    .body(axum::body::Body::empty())
-                    .unwrap();
-            } else {
-                // Update the DID
-                tracing::info!("Updating device from DID {} to {}", device.did, req.did);
-                let result = sqlx::query!(
-                    r#"
-                    UPDATE user_devices
-                    SET did = $1, updated_at = NOW()
-                    WHERE device_token = $2
-                    "#,
-                    req.did,
-                    req.device_token
-                )
-                .execute(&mut *tx)
-                .await;
-
-                match result {
-                    Ok(_) => {
-                        // Commit transaction
-                        if let Err(e) = tx.commit().await {
-                            tracing::error!("Error committing transaction: {}", e);
-                            return axum::response::Response::builder()
-                                .status(500)
-                                .body(axum::body::Body::from(format!("Database error: {}", e)))
-                                .unwrap();
-                        }
-
-                        tracing::info!("Device token updated successfully");
-                        return axum::response::Response::builder()
-                            .status(200)
-                            .body(axum::body::Body::empty())
-                            .unwrap();
-                    }
-                    Err(e) => {
-                        let _ = tx.rollback().await;
-                        tracing::error!("Error updating device: {}", e);
-                        return axum::response::Response::builder()
-                            .status(500)
-                            .body(axum::body::Body::from(format!("Database error: {}", e)))
-                            .unwrap();
-                    }
-                }
-            }
-        }
-        Ok(None) => {
-            // Create new device record
-            tracing::info!("Creating new device registration");
-            let result = sqlx::query!(
-                r#"
-                INSERT INTO user_devices (did, device_token)
-                VALUES ($1, $2)
-                RETURNING id
-                "#,
-                req.did,
-                req.device_token
-            )
-            .fetch_one(&mut *tx)
-            .await;
-
-            match result {
-                Ok(row) => {
-                    // Create default preferences
-                    match sqlx::query!(
-                        r#"
-                        INSERT INTO notification_preferences (user_id)
-                        VALUES ($1)
-                        "#,
-                        row.id
-                    )
-                    .execute(&mut *tx)
-                    .await
-                    {
-                        Ok(_) => {
-                            // Commit transaction
-                            if let Err(e) = tx.commit().await {
-                                tracing::error!("Error committing transaction: {}", e);
-                                return axum::response::Response::builder()
-                                    .status(500)
-                                    .body(axum::body::Body::from(format!("Database error: {}", e)))
-                                    .unwrap();
-                            }
-
-                            tracing::info!("Device registered successfully");
-                            return axum::response::Response::builder()
-                                .status(201)
-                                .body(axum::body::Body::empty())
-                                .unwrap();
-                        }
-                        Err(e) => {
-                            let _ = tx.rollback().await;
-                            tracing::error!("Error creating preferences: {}", e);
-                            return axum::response::Response::builder()
-                                .status(500)
-                                .body(axum::body::Body::from(format!("Database error: {}", e)))
-                                .unwrap();
-                        }
-                    }
-                }
-                Err(e) => {
-                    let _ = tx.rollback().await;
-                    tracing::error!("Error registering device: {}", e);
-                    return axum::response::Response::builder()
-                        .status(500)
-                        .body(axum::body::Body::from(format!("Database error: {}", e)))
-                        .unwrap();
-                }
-            }
-        }
+    .await
+    {
+        Ok(device) => device,
         Err(e) => {
             let _ = tx.rollback().await;
             tracing::error!("Database error: {}", e);
-            return axum::response::Response::builder()
-                .status(500)
-                .body(axum::body::Body::from(format!("Database error: {}", e)))
-                .unwrap();
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Database error: {}", e),
+            );
         }
+    };
+
+    if let Some(device) = existing_registration {
+        if let Some(key_id) = &device.app_attest_key_id {
+            if key_id != &req.proof.key_id {
+                let _ = tx.rollback().await;
+                tracing::warn!(
+                    "App Attest key mismatch for DID {} (expected {}, got {})",
+                    req.did,
+                    key_id,
+                    req.proof.key_id
+                );
+                return error_response(StatusCode::UNAUTHORIZED, "app attest key mismatch");
+            }
+        } else {
+            let _ = tx.rollback().await;
+            tracing::warn!(
+                "Existing device missing App Attest provisioning for DID {}",
+                req.did
+            );
+            return error_response(
+                StatusCode::PRECONDITION_REQUIRED,
+                "device requires re-attestation",
+            );
+        }
+
+        if let Err(e) = state.app_attest.validate_challenge(
+            device.app_attest_challenge.as_deref(),
+            device.app_attest_challenge_expires_at,
+            &req.proof.challenge,
+        ) {
+            let _ = tx.rollback().await;
+            tracing::warn!("Challenge validation failed for DID {}: {}", req.did, e);
+            return error_response(StatusCode::UNAUTHORIZED, "invalid or expired challenge");
+        }
+
+        let public_key = match &device.app_attest_public_key {
+            Some(key) => key.clone(),
+            None => {
+                let _ = tx.rollback().await;
+                tracing::warn!(
+                    "Existing device missing App Attest public key for DID {}",
+                    req.did
+                );
+                return error_response(
+                    StatusCode::PRECONDITION_REQUIRED,
+                    "device requires re-attestation",
+                );
+            }
+        };
+
+        let previous_counter = match u32::try_from(device.app_attest_counter) {
+            Ok(value) => value,
+            Err(_) => {
+                let _ = tx.rollback().await;
+                tracing::error!("Invalid stored counter for DID {}", req.did);
+                return error_response(StatusCode::INTERNAL_SERVER_ERROR, "invalid counter state");
+            }
+        };
+
+        let assertion = match state.app_attest.verify_assertion(
+            &req.proof.assertion,
+            &req.proof.client_data,
+            &public_key,
+            previous_counter,
+            device.app_attest_challenge.as_deref(),
+            &req.proof.challenge,
+        ) {
+            Ok(result) => result,
+            Err(err) => {
+                let _ = tx.rollback().await;
+                tracing::warn!("App Attest assertion failed for DID {}: {}", req.did, err);
+                return error_response(StatusCode::UNAUTHORIZED, "invalid app attest assertion");
+            }
+        };
+
+        let (next_challenge, expires_at) = state.app_attest.issue_challenge();
+
+        if let Err(e) = sqlx::query(
+            r#"
+            UPDATE user_devices
+            SET updated_at = NOW(),
+                app_attest_counter = $1,
+                app_attest_challenge = $2,
+                app_attest_challenge_expires_at = $3,
+                app_attest_last_verified_at = NOW()
+            WHERE id = $4
+            "#,
+        )
+        .bind(i64::from(assertion.counter))
+        .bind(&next_challenge)
+        .bind(expires_at)
+        .bind(device.id)
+        .execute(&mut *tx)
+        .await
+        {
+            let _ = tx.rollback().await;
+            tracing::error!("Error updating device: {}", e);
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Database error: {}", e),
+            );
+        }
+
+        if let Err(e) = tx.commit().await {
+            tracing::error!("Error committing transaction: {}", e);
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Database error: {}", e),
+            );
+        }
+
+        let response = RegisterResponse {
+            next_challenge: ChallengeEnvelope {
+                challenge: next_challenge,
+                expires_at,
+            },
+        };
+
+        return (StatusCode::OK, Json(response)).into_response();
     }
+
+    let attestation_payload = match &req.app_attest_attestation {
+        Some(payload) => payload,
+        None => {
+            let _ = tx.rollback().await;
+            tracing::warn!(
+                "Missing App Attest attestation for new device DID {}",
+                req.did
+            );
+            return error_response(StatusCode::BAD_REQUEST, "attestation payload required");
+        }
+    };
+
+    let attestation = match state.app_attest.verify_attestation(
+        attestation_payload,
+        &req.proof.challenge,
+        &req.proof.key_id,
+    ) {
+        Ok(data) => data,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            tracing::warn!("App Attest attestation failed for DID {}: {}", req.did, err);
+            return error_response(StatusCode::UNAUTHORIZED, "invalid attestation payload");
+        }
+    };
+
+    let assertion = match state.app_attest.verify_assertion(
+        &req.proof.assertion,
+        &req.proof.client_data,
+        &attestation.public_key,
+        0,
+        None,
+        &req.proof.challenge,
+    ) {
+        Ok(result) => result,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            tracing::warn!("App Attest assertion failed for DID {}: {}", req.did, err);
+            return error_response(StatusCode::UNAUTHORIZED, "invalid app attest assertion");
+        }
+    };
+
+    let (next_challenge, expires_at) = state.app_attest.issue_challenge();
+
+    let new_device_id = match sqlx::query_scalar::<_, uuid::Uuid>(
+        r#"
+        INSERT INTO user_devices (
+            did,
+            device_token,
+            app_attest_key_id,
+            app_attest_public_key,
+            app_attest_receipt,
+            app_attest_counter,
+            app_attest_challenge,
+            app_attest_challenge_expires_at,
+            app_attest_last_verified_at
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+        RETURNING id
+        "#,
+    )
+    .bind(&req.did)
+    .bind(&req.device_token)
+    .bind(&req.proof.key_id)
+    .bind(attestation.public_key)
+    .bind(attestation.receipt)
+    .bind(i64::from(assertion.counter))
+    .bind(next_challenge.clone())
+    .bind(expires_at)
+    .fetch_one(&mut *tx)
+    .await
+    {
+        Ok(id) => id,
+        Err(e) => {
+            let _ = tx.rollback().await;
+            tracing::error!("Error registering device: {}", e);
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Database error: {}", e),
+            );
+        }
+    };
+
+    if let Err(e) = sqlx::query(
+        r#"
+        INSERT INTO notification_preferences (user_id)
+        VALUES ($1)
+        "#,
+    )
+    .bind(new_device_id)
+    .execute(&mut *tx)
+    .await
+    {
+        let _ = tx.rollback().await;
+        tracing::error!("Error creating preferences: {}", e);
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Database error: {}", e),
+        );
+    }
+
+    if let Err(e) = tx.commit().await {
+        tracing::error!("Error committing transaction: {}", e);
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Database error: {}", e),
+        );
+    }
+
+    let response = RegisterResponse {
+        next_challenge: ChallengeEnvelope {
+            challenge: next_challenge,
+            expires_at,
+        },
+    };
+
+    (StatusCode::CREATED, Json(response)).into_response()
 }
 
 async fn unregister_device(
     axum::extract::State(state): axum::extract::State<Arc<ApiState>>,
     Json(req): Json<UnregisterRequest>,
 ) -> axum::response::Response {
-    tracing::info!("Unregistering device with token: {}...", &req.device_token[..8]);
+    let token_preview = req.device_token.get(..8).unwrap_or(&req.device_token);
+    tracing::info!("Unregistering device with token: {}...", token_preview);
 
     // Start a transaction to ensure consistency
     let mut tx = match state.db_pool.begin().await {
@@ -333,30 +668,119 @@ async fn unregister_device(
     };
 
     // Find the device to delete
-    let device_result = sqlx::query_as!(
-        UserDevice,
+    let device_result = sqlx::query_as::<_, UserDevice>(
         r#"
-        SELECT id, did, device_token, created_at, updated_at
+        SELECT id, did, device_token, created_at, updated_at,
+               app_attest_key_id,
+               app_attest_public_key,
+               app_attest_receipt,
+               app_attest_counter,
+               app_attest_challenge,
+               app_attest_challenge_expires_at,
+               app_attest_last_verified_at
         FROM user_devices
-        WHERE device_token = $1
+        WHERE device_token = $1 AND did = $2
         FOR UPDATE
         "#,
-        req.device_token
     )
+    .bind(&req.device_token)
+    .bind(&req.did)
     .fetch_optional(&mut *tx)
     .await;
 
     match device_result {
         Ok(Some(device)) => {
-            tracing::info!("Found device for DID: {}, proceeding with deletion", device.did);
-            
+            tracing::info!(
+                "Found device for DID: {}, proceeding with deletion",
+                device.did
+            );
+
+            if let Some(key_id) = &device.app_attest_key_id {
+                if key_id != &req.proof.key_id {
+                    let _ = tx.rollback().await;
+                    tracing::warn!(
+                        "App Attest key mismatch during unregister for DID {}",
+                        req.did
+                    );
+                    return error_response(StatusCode::UNAUTHORIZED, "app attest key mismatch");
+                }
+            } else {
+                let _ = tx.rollback().await;
+                tracing::warn!(
+                    "Device lacks App Attest provisioning during unregister for DID {}",
+                    req.did
+                );
+                return error_response(
+                    StatusCode::PRECONDITION_REQUIRED,
+                    "device requires re-attestation",
+                );
+            }
+
+            if let Err(e) = state.app_attest.validate_challenge(
+                device.app_attest_challenge.as_deref(),
+                device.app_attest_challenge_expires_at,
+                &req.proof.challenge,
+            ) {
+                let _ = tx.rollback().await;
+                tracing::warn!(
+                    "Challenge validation failed during unregister for DID {}: {}",
+                    req.did,
+                    e
+                );
+                return error_response(StatusCode::UNAUTHORIZED, "invalid or expired challenge");
+            }
+
+            let public_key = match &device.app_attest_public_key {
+                Some(key) => key.clone(),
+                None => {
+                    let _ = tx.rollback().await;
+                    tracing::warn!(
+                        "Missing App Attest public key during unregister for DID {}",
+                        req.did
+                    );
+                    return error_response(
+                        StatusCode::PRECONDITION_REQUIRED,
+                        "device requires re-attestation",
+                    );
+                }
+            };
+
+            let previous_counter = match u32::try_from(device.app_attest_counter) {
+                Ok(value) => value,
+                Err(_) => {
+                    let _ = tx.rollback().await;
+                    tracing::error!("Invalid counter during unregister for DID {}", req.did);
+                    return error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "invalid counter state",
+                    );
+                }
+            };
+
+            if let Err(err) = state.app_attest.verify_assertion(
+                &req.proof.assertion,
+                &req.proof.client_data,
+                &public_key,
+                previous_counter,
+                device.app_attest_challenge.as_deref(),
+                &req.proof.challenge,
+            ) {
+                let _ = tx.rollback().await;
+                tracing::warn!(
+                    "App Attest assertion failed during unregister for DID {}: {}",
+                    req.did,
+                    err
+                );
+                return error_response(StatusCode::UNAUTHORIZED, "invalid app attest assertion");
+            }
+
             // Delete the device (this will cascade delete notification preferences)
-            let delete_result = sqlx::query!(
-                "DELETE FROM user_devices WHERE device_token = $1",
-                req.device_token
-            )
-            .execute(&mut *tx)
-            .await;
+            let delete_result =
+                sqlx::query("DELETE FROM user_devices WHERE device_token = $1 AND did = $2")
+                    .bind(&req.device_token)
+                    .bind(&req.did)
+                    .execute(&mut *tx)
+                    .await;
 
             match delete_result {
                 Ok(result) => {
@@ -369,7 +793,7 @@ async fn unregister_device(
                                 .body(axum::body::Body::from(format!("Database error: {}", e)))
                                 .unwrap();
                         }
-                        
+
                         tracing::info!("Device unregistered successfully");
                         axum::response::Response::builder()
                             .status(200)
@@ -418,39 +842,125 @@ async fn unregister_device(
 async fn get_preferences(
     axum::extract::State(state): axum::extract::State<Arc<ApiState>>,
     Query(query): Query<PreferencesQuery>,
-) -> Result<Json<PreferencesRequest>, axum::http::StatusCode> {
-    // Find user devices
-    let device = sqlx::query_as!(
-        UserDevice,
+) -> Result<Json<PreferencesResponse>, axum::http::StatusCode> {
+    let mut tx = state
+        .db_pool
+        .begin()
+        .await
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let device = sqlx::query_as::<_, UserDevice>(
         r#"
-        SELECT id, did, device_token, created_at, updated_at
+        SELECT id, did, device_token, created_at, updated_at,
+               app_attest_key_id,
+               app_attest_public_key,
+               app_attest_receipt,
+               app_attest_counter,
+               app_attest_challenge,
+               app_attest_challenge_expires_at,
+               app_attest_last_verified_at
         FROM user_devices
-        WHERE did = $1
-        LIMIT 1
+        WHERE device_token = $1 AND did = $2
+        FOR UPDATE
         "#,
-        query.did,
     )
-    .fetch_optional(&state.db_pool)
+    .bind(&query.device_token)
+    .bind(&query.did)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let device = device.ok_or(axum::http::StatusCode::NOT_FOUND)?;
+    let device = match device {
+        Some(device) => device,
+        None => {
+            tx.rollback().await.ok();
+            return Err(axum::http::StatusCode::NOT_FOUND);
+        }
+    };
 
-    // Get preferences
-    let prefs = sqlx::query_as!(
-        NotificationPreference,
+    if let Some(key_id) = &device.app_attest_key_id {
+        if key_id != &query.proof.key_id {
+            tx.rollback().await.ok();
+            return Err(axum::http::StatusCode::UNAUTHORIZED);
+        }
+    } else {
+        tx.rollback().await.ok();
+        return Err(axum::http::StatusCode::PRECONDITION_REQUIRED);
+    }
+
+    if let Err(_) = state.app_attest.validate_challenge(
+        device.app_attest_challenge.as_deref(),
+        device.app_attest_challenge_expires_at,
+        &query.proof.challenge,
+    ) {
+        tx.rollback().await.ok();
+        return Err(axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    let public_key = match &device.app_attest_public_key {
+        Some(key) => key.clone(),
+        None => {
+            tx.rollback().await.ok();
+            return Err(axum::http::StatusCode::PRECONDITION_REQUIRED);
+        }
+    };
+
+    let previous_counter = u32::try_from(device.app_attest_counter)
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let assertion = match state.app_attest.verify_assertion(
+        &query.proof.assertion,
+        &query.proof.client_data,
+        &public_key,
+        previous_counter,
+        device.app_attest_challenge.as_deref(),
+        &query.proof.challenge,
+    ) {
+        Ok(result) => result,
+        Err(_) => {
+            tx.rollback().await.ok();
+            return Err(axum::http::StatusCode::UNAUTHORIZED);
+        }
+    };
+
+    let (next_challenge, expires_at) = state.app_attest.issue_challenge();
+
+    sqlx::query(
+        r#"
+        UPDATE user_devices
+        SET app_attest_counter = $1,
+            app_attest_challenge = $2,
+            app_attest_challenge_expires_at = $3,
+            app_attest_last_verified_at = NOW(),
+            updated_at = NOW()
+        WHERE id = $4
+        "#,
+    )
+    .bind(i64::from(assertion.counter))
+    .bind(&next_challenge)
+    .bind(expires_at)
+    .bind(device.id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let prefs = sqlx::query_as::<_, NotificationPreference>(
         r#"
         SELECT user_id, mentions, replies, likes, follows, reposts, quotes
         FROM notification_preferences
         WHERE user_id = $1
         "#,
-        device.id
     )
-    .fetch_one(&state.db_pool)
+    .bind(device.id)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    Ok(Json(PreferencesRequest {
+    tx.commit()
+        .await
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let body = PreferencesBody {
         did: query.did,
         mentions: prefs.mentions,
         replies: prefs.replies,
@@ -458,62 +968,233 @@ async fn get_preferences(
         follows: prefs.follows,
         reposts: prefs.reposts,
         quotes: prefs.quotes,
+    };
+
+    Ok(Json(PreferencesResponse {
+        preferences: body,
+        next_challenge: ChallengeEnvelope {
+            challenge: next_challenge,
+            expires_at,
+        },
     }))
 }
 
 async fn update_preferences(
     axum::extract::State(state): axum::extract::State<Arc<ApiState>>,
-    Json(req): Json<PreferencesRequest>,
-) -> axum::http::StatusCode {
-    // Find ALL user devices for this DID (remove the LIMIT 1)
-    let devices = sqlx::query_as!(
-        UserDevice,
+    Json(req): Json<PreferencesUpdateRequest>,
+) -> axum::response::Response {
+    let mut tx = match state.db_pool.begin().await {
+        Ok(tx) => tx,
+        Err(e) => {
+            tracing::error!("Failed to start transaction for preferences update: {}", e);
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "database error");
+        }
+    };
+
+    let device = match sqlx::query_as::<_, UserDevice>(
         r#"
-        SELECT id, did, device_token, created_at, updated_at
+        SELECT id, did, device_token, created_at, updated_at,
+               app_attest_key_id,
+               app_attest_public_key,
+               app_attest_receipt,
+               app_attest_counter,
+               app_attest_challenge,
+               app_attest_challenge_expires_at,
+               app_attest_last_verified_at
+        FROM user_devices
+        WHERE device_token = $1 AND did = $2
+        FOR UPDATE
+        "#,
+    )
+    .bind(&req.device_token)
+    .bind(&req.did)
+    .fetch_optional(&mut *tx)
+    .await
+    {
+        Ok(Some(device)) => device,
+        Ok(None) => {
+            tx.rollback().await.ok();
+            return error_response(StatusCode::NOT_FOUND, "device not registered");
+        }
+        Err(e) => {
+            tx.rollback().await.ok();
+            tracing::error!("Failed to fetch device for preferences update: {}", e);
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "database error");
+        }
+    };
+
+    if let Some(key_id) = &device.app_attest_key_id {
+        if key_id != &req.proof.key_id {
+            tx.rollback().await.ok();
+            return error_response(StatusCode::UNAUTHORIZED, "app attest key mismatch");
+        }
+    } else {
+        tx.rollback().await.ok();
+        return error_response(
+            StatusCode::PRECONDITION_REQUIRED,
+            "device requires re-attestation",
+        );
+    }
+
+    if let Err(err) = state.app_attest.validate_challenge(
+        device.app_attest_challenge.as_deref(),
+        device.app_attest_challenge_expires_at,
+        &req.proof.challenge,
+    ) {
+        tx.rollback().await.ok();
+        tracing::warn!(
+            "Challenge validation failed for preferences update on DID {}: {}",
+            req.did,
+            err
+        );
+        return error_response(StatusCode::UNAUTHORIZED, "invalid or expired challenge");
+    }
+
+    let public_key = match &device.app_attest_public_key {
+        Some(key) => key.clone(),
+        None => {
+            tx.rollback().await.ok();
+            return error_response(
+                StatusCode::PRECONDITION_REQUIRED,
+                "device requires re-attestation",
+            );
+        }
+    };
+
+    let previous_counter = match u32::try_from(device.app_attest_counter) {
+        Ok(value) => value,
+        Err(_) => {
+            tx.rollback().await.ok();
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "invalid counter state");
+        }
+    };
+
+    let assertion = match state.app_attest.verify_assertion(
+        &req.proof.assertion,
+        &req.proof.client_data,
+        &public_key,
+        previous_counter,
+        device.app_attest_challenge.as_deref(),
+        &req.proof.challenge,
+    ) {
+        Ok(result) => result,
+        Err(err) => {
+            tx.rollback().await.ok();
+            tracing::warn!(
+                "App Attest assertion failed for preferences update on DID {}: {}",
+                req.did,
+                err
+            );
+            return error_response(StatusCode::UNAUTHORIZED, "invalid app attest assertion");
+        }
+    };
+
+    let (next_challenge, expires_at) = state.app_attest.issue_challenge();
+
+    if let Err(e) = sqlx::query(
+        r#"
+        UPDATE user_devices
+        SET app_attest_counter = $1,
+            app_attest_challenge = $2,
+            app_attest_challenge_expires_at = $3,
+            app_attest_last_verified_at = NOW(),
+            updated_at = NOW()
+        WHERE id = $4
+        "#,
+    )
+    .bind(i64::from(assertion.counter))
+    .bind(&next_challenge)
+    .bind(expires_at)
+    .bind(device.id)
+    .execute(&mut *tx)
+    .await
+    {
+        tx.rollback().await.ok();
+        tracing::error!(
+            "Failed to update device metadata during preferences update: {}",
+            e
+        );
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR, "database error");
+    }
+
+    let device_ids = match sqlx::query_scalar::<_, uuid::Uuid>(
+        r#"
+        SELECT id
         FROM user_devices
         WHERE did = $1
         "#,
-        req.did,
     )
-    .fetch_all(&state.db_pool)
-    .await;
+    .bind(&req.did)
+    .fetch_all(&mut *tx)
+    .await
+    {
+        Ok(ids) if !ids.is_empty() => ids,
+        Ok(_) => {
+            tx.rollback().await.ok();
+            return error_response(StatusCode::NOT_FOUND, "no devices found for DID");
+        }
+        Err(e) => {
+            tx.rollback().await.ok();
+            tracing::error!("Failed to enumerate devices for preferences update: {}", e);
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "database error");
+        }
+    };
 
-    match devices {
-        Ok(devices) if !devices.is_empty() => {
-            // Update preferences for ALL devices associated with this DID
-            let mut success = true;
-            for device in devices {
-                let result = sqlx::query!(
-                    r#"
-                    UPDATE notification_preferences
-                    SET mentions = $1, replies = $2, likes = $3, follows = $4, reposts = $5, quotes = $6
-                    WHERE user_id = $7
-                    "#,
-                    req.mentions,
-                    req.replies,
-                    req.likes,
-                    req.follows,
-                    req.reposts,
-                    req.quotes,
-                    device.id
-                )
-                .execute(&state.db_pool)
-                .await;
-                
-                if result.is_err() {
-                    success = false;
-                }
-            }
-            
-            if success {
-                axum::http::StatusCode::OK
-            } else {
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR
-            }
-        },
-        Ok(_) => axum::http::StatusCode::NOT_FOUND,
-        Err(_) => axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+    for device_id in device_ids {
+        if let Err(e) = sqlx::query(
+            r#"
+            UPDATE notification_preferences
+            SET mentions = $1,
+                replies = $2,
+                likes = $3,
+                follows = $4,
+                reposts = $5,
+                quotes = $6
+            WHERE user_id = $7
+            "#,
+        )
+        .bind(req.mentions)
+        .bind(req.replies)
+        .bind(req.likes)
+        .bind(req.follows)
+        .bind(req.reposts)
+        .bind(req.quotes)
+        .bind(device_id)
+        .execute(&mut *tx)
+        .await
+        {
+            tx.rollback().await.ok();
+            tracing::error!(
+                "Failed to update preferences for device {}: {}",
+                device_id,
+                e
+            );
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "database error");
+        }
     }
+
+    if let Err(e) = tx.commit().await {
+        tracing::error!("Failed to commit preferences update: {}", e);
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR, "database error");
+    }
+
+    let response = PreferencesResponse {
+        preferences: PreferencesBody {
+            did: req.did,
+            mentions: req.mentions,
+            replies: req.replies,
+            likes: req.likes,
+            follows: req.follows,
+            reposts: req.reposts,
+            quotes: req.quotes,
+        },
+        next_challenge: ChallengeEnvelope {
+            challenge: next_challenge,
+            expires_at,
+        },
+    };
+
+    (StatusCode::OK, Json(response)).into_response()
 }
 
 // Add health check handler

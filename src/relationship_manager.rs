@@ -1,10 +1,9 @@
 use anyhow::{Context, Result};
 use moka::future::Cache;
 use sqlx::{Pool, Postgres};
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::collections::HashSet;
 use std::time::Duration;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 use crate::crypto::CryptoUtils;
 use crate::models::UserDevice;
@@ -14,7 +13,7 @@ pub struct RelationshipManager {
     mutes_cache: Cache<String, HashSet<String>>, // user_did -> set of muted_dids
     blocks_cache: Cache<String, HashSet<String>>, // user_did -> set of blocked_dids
     db_pool: Pool<Postgres>,
-    crypto: CryptoUtils, // Add crypto utils
+    crypto: CryptoUtils,      // Add crypto utils
     use_hashed_storage: bool, // Flag to control which storage to use
 }
 
@@ -33,12 +32,12 @@ impl RelationshipManager {
 
         // Create crypto utils
         let crypto = CryptoUtils::new().expect("Failed to initialize crypto utils");
-        
+
         // Determine if we should use hashed storage by default
         let use_hashed_storage = std::env::var("USE_HASHED_RELATIONSHIPS")
             .map(|v| v.to_lowercase() == "true")
             .unwrap_or(true); // Default to true for privacy
-        
+
         if use_hashed_storage {
             info!("Using privacy-preserving hashed relationship storage");
         }
@@ -63,7 +62,7 @@ impl RelationshipManager {
         if self.use_hashed_storage {
             // Hash the target_did with the user-specific salt
             let target_hash = self.crypto.hash_did(target_did, user_did);
-            
+
             // Check database for the hash directly
             match sqlx::query!(
                 r#"
@@ -76,7 +75,8 @@ impl RelationshipManager {
                 self.crypto.server_secret
             )
             .fetch_one(&self.db_pool)
-            .await {
+            .await
+            {
                 Ok(row) => return row.count.unwrap_or(0) > 0,
                 Err(e) => {
                     error!("Failed to check muted hash for {}: {}", user_did, e);
@@ -106,7 +106,7 @@ impl RelationshipManager {
         if self.use_hashed_storage {
             // Hash the target_did with the user-specific salt
             let target_hash = self.crypto.hash_did(target_did, user_did);
-            
+
             // Check database for the hash directly
             match sqlx::query!(
                 r#"
@@ -119,7 +119,8 @@ impl RelationshipManager {
                 self.crypto.server_secret
             )
             .fetch_one(&self.db_pool)
-            .await {
+            .await
+            {
                 Ok(row) => return row.count.unwrap_or(0) > 0,
                 Err(e) => {
                     error!("Failed to check blocked hash for {}: {}", user_did, e);
@@ -208,7 +209,10 @@ impl RelationshipManager {
         .await
         .context("Failed to fetch user mutes")?;
 
-        let mutes: HashSet<String> = rows.into_iter().map(|row| row.muted_did.unwrap_or_default()).collect();
+        let mutes: HashSet<String> = rows
+            .into_iter()
+            .map(|row| row.muted_did.unwrap_or_default())
+            .collect();
         Ok(mutes)
     }
 
@@ -245,22 +249,31 @@ impl RelationshipManager {
         .await
         .context("Failed to fetch user blocks")?;
 
-        let blocks: HashSet<String> = rows.into_iter().map(|row| row.blocked_did.unwrap_or_default()).collect();
+        let blocks: HashSet<String> = rows
+            .into_iter()
+            .map(|row| row.blocked_did.unwrap_or_default())
+            .collect();
         Ok(blocks)
     }
 
     // Authenticate device token before updating relationships
     async fn authenticate_device(&self, did: &str, device_token: &str) -> Result<UserDevice> {
-        let device = sqlx::query_as!(
-            UserDevice,
+        let device = sqlx::query_as::<_, UserDevice>(
             r#"
-            SELECT id, did, device_token, created_at, updated_at
+            SELECT id, did, device_token, created_at, updated_at,
+                   app_attest_key_id,
+                   app_attest_public_key,
+                   app_attest_receipt,
+                   app_attest_counter,
+                   app_attest_challenge,
+                   app_attest_challenge_expires_at,
+                   app_attest_last_verified_at
             FROM user_devices
             WHERE did = $1 AND device_token = $2
             "#,
-            did,
-            device_token
         )
+        .bind(did)
+        .bind(device_token)
         .fetch_optional(&self.db_pool)
         .await
         .context("Error querying device")?;
@@ -280,17 +293,31 @@ impl RelationshipManager {
         blocks: Vec<String>,
     ) -> Result<()> {
         // Authenticate first
-        let device = self.authenticate_device(user_did, device_token).await?;
+        self.authenticate_device(user_did, device_token).await?;
 
         // Start a transaction for the entire batch
         let mut tx = self.db_pool.begin().await?;
 
         if self.use_hashed_storage {
             // Update using privacy-preserving hashed storage
-            self.update_relationships_batch_hashed(&mut tx, user_did, device_token, &mutes, &blocks).await?;
+            self.update_relationships_batch_hashed(
+                &mut tx,
+                user_did,
+                device_token,
+                &mutes,
+                &blocks,
+            )
+            .await?;
         } else {
             // Update using plaintext storage
-            self.update_relationships_batch_plaintext(&mut tx, user_did, device_token, &mutes, &blocks).await?;
+            self.update_relationships_batch_plaintext(
+                &mut tx,
+                user_did,
+                device_token,
+                &mutes,
+                &blocks,
+            )
+            .await?;
         }
 
         // Commit the transaction
@@ -312,7 +339,7 @@ impl RelationshipManager {
         info!(user_did = %user_did, "Updated user relationships in batch");
         Ok(())
     }
-    
+
     // Update relationships using plaintext storage
     async fn update_relationships_batch_plaintext(
         &self,
@@ -410,10 +437,10 @@ impl RelationshipManager {
         .execute(&mut **tx)
         .await
         .context("Failed to record audit log")?;
-        
+
         Ok(())
     }
-    
+
     // Update relationships using hashed storage
     async fn update_relationships_batch_hashed(
         &self,
@@ -424,15 +451,21 @@ impl RelationshipManager {
         blocks: &[String],
     ) -> Result<()> {
         // Clear existing hashed relationships
-        sqlx::query!("DELETE FROM user_mutes_encrypted WHERE user_did = $1", user_did)
-            .execute(&mut **tx)
-            .await
-            .context("Failed to delete existing hashed mutes")?;
+        sqlx::query!(
+            "DELETE FROM user_mutes_encrypted WHERE user_did = $1",
+            user_did
+        )
+        .execute(&mut **tx)
+        .await
+        .context("Failed to delete existing hashed mutes")?;
 
-        sqlx::query!("DELETE FROM user_blocks_encrypted WHERE user_did = $1", user_did)
-            .execute(&mut **tx)
-            .await
-            .context("Failed to delete existing hashed blocks")?;
+        sqlx::query!(
+            "DELETE FROM user_blocks_encrypted WHERE user_did = $1",
+            user_did
+        )
+        .execute(&mut **tx)
+        .await
+        .context("Failed to delete existing hashed blocks")?;
 
         // Also clear from plaintext tables to maintain consistency
         sqlx::query!("DELETE FROM user_mutes WHERE user_did = $1", user_did)
@@ -446,18 +479,21 @@ impl RelationshipManager {
             .context("Failed to delete existing plaintext blocks")?;
 
         // Hash the mutes and blocks
-        let hashed_mutes = mutes.iter()
+        let hashed_mutes = mutes
+            .iter()
             .map(|did| (did.clone(), self.crypto.hash_did(did, user_did)))
             .collect::<Vec<(String, String)>>();
 
-        let hashed_blocks = blocks.iter()
+        let hashed_blocks = blocks
+            .iter()
             .map(|did| (did.clone(), self.crypto.hash_did(did, user_did)))
             .collect::<Vec<(String, String)>>();
 
         // Insert mutes into both tables (plaintext for cache, hashed for storage)
         if !mutes.is_empty() {
             // Insert into plaintext table for cache consistency
-            let mut query_builder = String::from("INSERT INTO user_mutes (user_did, muted_did) VALUES ");
+            let mut query_builder =
+                String::from("INSERT INTO user_mutes (user_did, muted_did) VALUES ");
             let mut params = Vec::new();
             let mut param_idx = 1;
 
@@ -480,7 +516,9 @@ impl RelationshipManager {
                 .context("Failed to batch insert plaintext mute relationships")?;
 
             // Insert into hashed table for privacy
-            let mut query_builder = String::from("INSERT INTO user_mutes_encrypted (user_did, muted_did_encrypted) VALUES ");
+            let mut query_builder = String::from(
+                "INSERT INTO user_mutes_encrypted (user_did, muted_did_encrypted) VALUES ",
+            );
             let mut params = Vec::new();
             let mut param_idx = 1;
 
@@ -488,7 +526,12 @@ impl RelationshipManager {
                 if i > 0 {
                     query_builder.push_str(", ");
                 }
-                query_builder.push_str(&format!("(${}, pgp_sym_encrypt(${}, ${}))", param_idx, param_idx + 1, param_idx + 2));
+                query_builder.push_str(&format!(
+                    "(${}, pgp_sym_encrypt(${}, ${}))",
+                    param_idx,
+                    param_idx + 1,
+                    param_idx + 2
+                ));
                 params.push(user_did.to_string());
                 params.push(muted_did_hash.clone());
                 params.push(self.crypto.server_secret.clone());
@@ -507,7 +550,8 @@ impl RelationshipManager {
         // Same for blocks
         if !blocks.is_empty() {
             // Insert into plaintext table for cache consistency
-            let mut query_builder = String::from("INSERT INTO user_blocks (user_did, blocked_did) VALUES ");
+            let mut query_builder =
+                String::from("INSERT INTO user_blocks (user_did, blocked_did) VALUES ");
             let mut params = Vec::new();
             let mut param_idx = 1;
 
@@ -530,7 +574,9 @@ impl RelationshipManager {
                 .context("Failed to batch insert plaintext block relationships")?;
 
             // Insert into hashed table for privacy
-            let mut query_builder = String::from("INSERT INTO user_blocks_encrypted (user_did, blocked_did_encrypted) VALUES ");
+            let mut query_builder = String::from(
+                "INSERT INTO user_blocks_encrypted (user_did, blocked_did_encrypted) VALUES ",
+            );
             let mut params = Vec::new();
             let mut param_idx = 1;
 
@@ -538,7 +584,12 @@ impl RelationshipManager {
                 if i > 0 {
                     query_builder.push_str(", ");
                 }
-                query_builder.push_str(&format!("(${}, pgp_sym_encrypt(${}, ${}))", param_idx, param_idx + 1, param_idx + 2));
+                query_builder.push_str(&format!(
+                    "(${}, pgp_sym_encrypt(${}, ${}))",
+                    param_idx,
+                    param_idx + 1,
+                    param_idx + 2
+                ));
                 params.push(user_did.to_string());
                 params.push(blocked_did_hash.clone());
                 params.push(self.crypto.server_secret.clone());
@@ -576,7 +627,7 @@ impl RelationshipManager {
         .execute(&mut **tx)
         .await
         .context("Failed to record audit log")?;
-        
+
         Ok(())
     }
 

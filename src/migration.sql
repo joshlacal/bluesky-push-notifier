@@ -1,9 +1,10 @@
 CREATE TABLE user_devices (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     did TEXT NOT NULL,
-    device_token TEXT NOT NULL UNIQUE,
+    device_token TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT user_devices_token_did_unique UNIQUE (device_token, did)
 );
 
 CREATE INDEX idx_user_devices_did ON user_devices(did);

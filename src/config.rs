@@ -11,6 +11,8 @@ pub struct Config {
     pub apns_team_id: String,
     pub apns_topic: String,
     pub apns_production: bool,
+    pub app_attest_app_id: String,
+    pub app_attest_challenge_ttl_secs: u64,
 }
 
 impl Config {
@@ -28,6 +30,12 @@ impl Config {
             apns_production: env::var("APNS_PRODUCTION")
                 .map(|v| v == "true")
                 .unwrap_or(false),
+            app_attest_app_id: env::var("APP_ATTEST_APP_ID")
+                .context("APP_ATTEST_APP_ID must be set")?,
+            app_attest_challenge_ttl_secs: env::var("APP_ATTEST_CHALLENGE_TTL_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(300),
         })
     }
 }

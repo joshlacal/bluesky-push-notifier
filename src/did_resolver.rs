@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
-use tracing::{debug, info, warn}; 
+use tracing::{debug, info, warn};
 
 // Simplified DID Document structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,7 +70,8 @@ impl DidResolver {
         let db_result = self.get_from_db_cache(did).await?;
         if let Some((document, handle)) = db_result {
             // Update memory cache and return handle
-            self.update_memory_cache(did.to_string(), document, handle.clone()).await;
+            self.update_memory_cache(did.to_string(), document, handle.clone())
+                .await;
             debug!(did = %did, handle = %handle, "Handle found in database cache");
             return Ok(handle);
         }
@@ -78,10 +79,11 @@ impl DidResolver {
         // 3. Resolve via network
         info!(did = %did, "Resolving DID from network");
         let (document, handle) = self.resolve_did_network(did).await?;
-        
+
         // 4. Update both caches
-        self.update_caches(did.to_string(), document.clone(), handle.clone()).await?;
-        
+        self.update_caches(did.to_string(), document.clone(), handle.clone())
+            .await?;
+
         Ok(handle)
     }
 
@@ -108,33 +110,41 @@ impl DidResolver {
         )
         .fetch_optional(&self.db_pool)
         .await?;
-        
+
         if let Some(row) = row {
             let document: DidDocument = serde_json::from_value(row.document)
                 .with_context(|| "Failed to deserialize DID document from database")?;
             return Ok(Some((document, row.handle)));
         }
-        
+
         Ok(None)
     }
 
     // Update memory cache with new DID info
     async fn update_memory_cache(&self, did: String, document: DidDocument, handle: String) {
         let mut cache = self.memory_cache.write().await;
-        cache.insert(did, CachedDidInfo {
-            document,
-            handle,
-            expires_at: Instant::now() + self.ttl,
-        });
+        cache.insert(
+            did,
+            CachedDidInfo {
+                document,
+                handle,
+                expires_at: Instant::now() + self.ttl,
+            },
+        );
     }
 
     // Update both caches with new DID info
-    async fn update_caches(&self, did: String, document: DidDocument, handle: String) -> Result<()> {
+    async fn update_caches(
+        &self,
+        did: String,
+        document: DidDocument,
+        handle: String,
+    ) -> Result<()> {
         // Update database cache
         let expires_at = time::OffsetDateTime::now_utc() + time::Duration::hours(24);
         let json_doc = serde_json::to_value(document.clone())
             .with_context(|| "Failed to serialize DID document")?;
-            
+
         sqlx::query!(
             r#"
             INSERT INTO did_cache (did, document, handle, expires_at)
@@ -149,10 +159,10 @@ impl DidResolver {
         )
         .execute(&self.db_pool)
         .await?;
-        
+
         // Update memory cache
         self.update_memory_cache(did, document, handle).await;
-        
+
         Ok(())
     }
 
@@ -170,55 +180,62 @@ impl DidResolver {
     // Resolve did:plc
     async fn resolve_plc_did(&self, did: &str) -> Result<(DidDocument, String)> {
         let url = format!("https://plc.directory/{}", did);
-        let response = self.http_client.get(&url)
+        let response = self
+            .http_client
+            .get(&url)
             .send()
             .await
             .with_context(|| "Failed to fetch PLC DID document")?;
-            
+
         if !response.status().is_success() {
             return Err(anyhow::anyhow!(
-                "Failed to fetch PLC DID document, status: {}", 
+                "Failed to fetch PLC DID document, status: {}",
                 response.status()
             ));
         }
-        
-        let document: DidDocument = response.json()
+
+        let document: DidDocument = response
+            .json()
             .await
             .with_context(|| "Failed to parse PLC DID document")?;
-            
+
         // Extract handle from alsoKnownAs
         let handle = self.extract_handle_from_document(&document)?;
-        
+
         Ok((document, handle))
     }
 
     // Resolve did:web
     async fn resolve_web_did(&self, did: &str) -> Result<(DidDocument, String)> {
         // Convert did:web:example.com to https://example.com/.well-known/did.json
-        let domain = did.strip_prefix("did:web:")
+        let domain = did
+            .strip_prefix("did:web:")
             .ok_or_else(|| anyhow::anyhow!("Invalid did:web format"))?;
-            
+
         let url = format!("https://{}/.well-known/did.json", domain);
-        
-        let response = self.http_client.get(&url)
+
+        let response = self
+            .http_client
+            .get(&url)
             .send()
             .await
             .with_context(|| "Failed to fetch Web DID document")?;
-            
+
         if !response.status().is_success() {
             return Err(anyhow::anyhow!(
-                "Failed to fetch Web DID document, status: {}", 
+                "Failed to fetch Web DID document, status: {}",
                 response.status()
             ));
         }
-        
-        let document: DidDocument = response.json()
+
+        let document: DidDocument = response
+            .json()
             .await
             .with_context(|| "Failed to parse Web DID document")?;
-            
+
         // Extract handle from alsoKnownAs
         let handle = self.extract_handle_from_document(&document)?;
-        
+
         Ok((document, handle))
     }
 
@@ -238,7 +255,7 @@ impl DidResolver {
                 }
             }
         }
-        
+
         // Fallback if no valid handle found - use truncated DID
         let fallback = did_to_fallback_handle(&document.id);
         Ok(fallback)
@@ -247,7 +264,7 @@ impl DidResolver {
     // Get handles for multiple DIDs in bulk
     pub async fn get_handles_bulk(&self, dids: &[String]) -> HashMap<String, String> {
         let mut result = HashMap::new();
-        
+
         // 1. Try memory cache first for all DIDs
         {
             let cache = self.memory_cache.read().await;
@@ -260,17 +277,18 @@ impl DidResolver {
                 }
             }
         }
-        
+
         // 2. Find missing DIDs
-        let missing_dids: Vec<String> = dids.iter()
+        let missing_dids: Vec<String> = dids
+            .iter()
             .filter(|did| !result.contains_key(*did))
             .cloned()
             .collect();
-            
+
         if missing_dids.is_empty() {
             return result;
         }
-        
+
         // 3. Try database cache for missing DIDs
         if let Ok(db_results) = self.get_from_db_cache_bulk(&missing_dids).await {
             for (did, doc, handle) in db_results {
@@ -280,32 +298,33 @@ impl DidResolver {
                 crate::metrics::DID_CACHE_HITS.inc();
             }
         }
-        
+
         // 4. Find still missing DIDs
-        let still_missing: Vec<String> = dids.iter()
+        let still_missing: Vec<String> = dids
+            .iter()
             .filter(|did| !result.contains_key(*did))
             .cloned()
             .collect();
-            
+
         if still_missing.is_empty() {
             return result;
         }
-        
+
         // 5. Resolve remaining DIDs with limited concurrency using JoinSet
         let semaphore = Arc::new(tokio::sync::Semaphore::new(5));
         let mut set = tokio::task::JoinSet::new();
-        
+
         // Track how many DIDs we need to resolve via network
         crate::metrics::DID_CACHE_MISSES.inc_by(still_missing.len() as f64);
-        
+
         for did in still_missing {
             let sem = semaphore.clone();
             let resolver = self.clone();
-            
+
             set.spawn(async move {
                 // Create a timer to measure resolution time
                 let timer = std::time::Instant::now();
-                
+
                 // Acquire permit to limit concurrency
                 let _permit = sem.acquire().await.unwrap();
                 match resolver.resolve_did_network(&did).await {
@@ -313,9 +332,9 @@ impl DidResolver {
                         // Record resolution time
                         let elapsed = timer.elapsed().as_secs_f64();
                         crate::metrics::DID_RESOLUTION_TIME.observe(elapsed);
-                        
+
                         Some((did, doc, handle))
-                    },
+                    }
                     Err(e) => {
                         warn!("Failed to resolve DID {}: {}", did, e);
                         None
@@ -323,7 +342,7 @@ impl DidResolver {
                 }
             });
         }
-        
+
         // Collect results as they complete
         while let Some(join_result) = set.join_next().await {
             if let Ok(Some((did, doc, handle))) = join_result {
@@ -337,48 +356,49 @@ impl DidResolver {
                 });
             }
         }
-        
+
         result
     }
-    
+
     // Fetch multiple DIDs from DB cache at once
-    async fn get_from_db_cache_bulk(&self, dids: &[String]) -> Result<Vec<(String, DidDocument, String)>> {
+    async fn get_from_db_cache_bulk(
+        &self,
+        dids: &[String],
+    ) -> Result<Vec<(String, DidDocument, String)>> {
         let mut results = Vec::new();
-        
+
         // Using a simple loop instead of a more complex query
         // Could be optimized with an IN clause for larger sets
         for chunk in dids.chunks(50) {
-            let placeholders: Vec<String> = (1..=chunk.len())
-                .map(|i| format!("${}", i))
-                .collect();
-                
+            let placeholders: Vec<String> = (1..=chunk.len()).map(|i| format!("${}", i)).collect();
+
             let query = format!(
                 "SELECT did, document, handle FROM did_cache 
                 WHERE did IN ({}) AND expires_at > NOW()",
                 placeholders.join(",")
             );
-            
+
             let mut q = sqlx::query(&query);
             for did in chunk {
                 q = q.bind(did);
             }
-            
+
             let rows = q.fetch_all(&self.db_pool).await?;
-            
+
             for row in rows {
                 let did: String = row.get("did");
                 let doc_json: serde_json::Value = row.get("document");
                 let handle: String = row.get("handle");
-                
+
                 if let Ok(doc) = serde_json::from_value(doc_json) {
                     results.push((did, doc, handle));
                 }
             }
         }
-        
+
         Ok(results)
     }
-    
+
     // Cleanup expired entries
     pub async fn cleanup_expired(&self) -> Result<usize> {
         // Clean memory cache
@@ -394,22 +414,21 @@ impl DidResolver {
                 keep
             });
         }
-        
+
         // Clean database cache
-        let db_result = sqlx::query!(
-            "DELETE FROM did_cache WHERE expires_at <= NOW() RETURNING did"
-        )
-        .fetch_all(&self.db_pool)
-        .await?;
-        
+        let db_result =
+            sqlx::query!("DELETE FROM did_cache WHERE expires_at <= NOW() RETURNING did")
+                .fetch_all(&self.db_pool)
+                .await?;
+
         let db_cleaned = db_result.len();
-        
+
         info!(
             memory_cleaned = %memory_cleaned,
             db_cleaned = %db_cleaned,
             "Cleaned expired DID cache entries"
         );
-        
+
         Ok(memory_cleaned + db_cleaned)
     }
 }
@@ -419,7 +438,7 @@ fn did_to_fallback_handle(did: &str) -> String {
     // Extract the last part of the DID and truncate
     let parts: Vec<&str> = did.split(':').collect();
     let last_part = parts.last().unwrap_or(&did);
-    
+
     if last_part.len() > 8 {
         format!("user_{}", &last_part[0..8])
     } else {

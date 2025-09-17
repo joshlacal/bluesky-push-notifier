@@ -1,15 +1,15 @@
 // post_resolver.rs
-use anyhow::{Result};
+use ::time::Duration as TimeDuration;
+use anyhow::Result;
 use circuit_breaker::CircuitBreaker;
 use reqwest::Client as HttpClient;
 use serde::{Deserialize, Serialize};
-use sqlx::{Pool, Postgres, types::time};
+use sqlx::{types::time, Pool, Postgres};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, RwLock, oneshot};
+use tokio::sync::{oneshot, Mutex, RwLock};
 use tracing::{debug, info, warn};
-use ::time::Duration as TimeDuration;
 
 // API response structures
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,20 +72,18 @@ impl PostResolver {
     pub fn new(db_pool: Pool<Postgres>, ttl_minutes: u64, bsky_service_url: String) -> Self {
         // Configure circuit breaker with appropriate settings
         let cb_config = CircuitBreakerConfig {
-            failure_threshold: 5,         // Trip after 5 failures
-            success_threshold: 2,         // Require 2 successful calls to reset
+            failure_threshold: 5,                   // Trip after 5 failures
+            success_threshold: 2,                   // Require 2 successful calls to reset
             open_duration: Duration::from_secs(30), // Stay open for 30 seconds
         };
-        
+
         let request_queue = Arc::new(Mutex::new(HashMap::new()));
         let trigger_send = Arc::new(tokio::sync::Notify::new());
-        
+
         // Create circuit breaker using the version's API
-        let circuit_breaker = CircuitBreaker::new(
-            cb_config.failure_threshold,
-            cb_config.open_duration
-        );
-        
+        let circuit_breaker =
+            CircuitBreaker::new(cb_config.failure_threshold, cb_config.open_duration);
+
         let resolver = Self {
             http_client: HttpClient::builder()
                 .timeout(Duration::from_secs(10))
@@ -99,13 +97,13 @@ impl PostResolver {
             request_queue,
             trigger_send,
         };
-        
+
         // Start background task for batch processing
         let resolver_clone = resolver.clone();
         tokio::spawn(async move {
             resolver_clone.run_request_processor().await;
         });
-        
+
         resolver
     }
 
@@ -113,7 +111,7 @@ impl PostResolver {
     pub async fn get_post_content(&self, uri: &str) -> Result<String> {
         // Create timer to measure fetching time
         let timer = std::time::Instant::now();
-        
+
         // 1. Check memory cache first
         let content = self.get_from_memory_cache(uri).await;
         if let Some(content) = content {
@@ -121,7 +119,7 @@ impl PostResolver {
             crate::metrics::POST_CACHE_HITS.inc();
             let elapsed = timer.elapsed().as_secs_f64();
             crate::metrics::POST_FETCH_TIME.observe(elapsed);
-            
+
             debug!(uri = %uri, "Post content found in memory cache");
             return Ok(content);
         }
@@ -135,14 +133,14 @@ impl PostResolver {
             crate::metrics::POST_CACHE_HITS.inc();
             let elapsed = timer.elapsed().as_secs_f64();
             crate::metrics::POST_FETCH_TIME.observe(elapsed);
-            
+
             debug!(uri = %uri, "Post content found in database cache");
             return Ok(text);
         }
 
         // 3. Record cache miss metric
         crate::metrics::POST_CACHE_MISSES.inc();
-        
+
         // 4. Queue request for batch processing
         info!(uri = %uri, "Queuing post content fetch for batch processing");
         let (sender, receiver) = oneshot::channel();
@@ -150,10 +148,10 @@ impl PostResolver {
             let mut queue = self.request_queue.lock().await;
             queue.insert(uri.to_string(), sender);
         }
-        
+
         // Notify the processor that we have a new request
         self.trigger_send.notify_one();
-        
+
         // Wait for the result with a timeout to ensure low latency
         match tokio::time::timeout(Duration::from_millis(150), receiver).await {
             Ok(result) => {
@@ -162,7 +160,7 @@ impl PostResolver {
                         // Record fetch time
                         let elapsed = timer.elapsed().as_secs_f64();
                         crate::metrics::POST_FETCH_TIME.observe(elapsed);
-                        
+
                         debug!(uri = %uri, "Received post content from batch processor");
                         text
                     }
@@ -171,7 +169,7 @@ impl PostResolver {
                         self.fetch_and_cache_individual(uri, timer).await
                     }
                 }
-            },
+            }
             Err(_) => {
                 // Timeout occurred, make an individual request instead
                 warn!(uri = %uri, "Batch processing timeout, falling back to direct fetch");
@@ -179,7 +177,7 @@ impl PostResolver {
             }
         }
     }
-    
+
     // Helper to fetch and cache an individual post (fallback)
     async fn fetch_and_cache_individual(&self, uri: &str, timer: Instant) -> Result<String> {
         match self.fetch_post_from_network_individual(uri).await {
@@ -193,14 +191,14 @@ impl PostResolver {
                         warn!("Failed to update caches: {}", e);
                     }
                 });
-                
+
                 // Record fetch time
                 let elapsed = timer.elapsed().as_secs_f64();
                 crate::metrics::POST_FETCH_TIME.observe(elapsed);
-                
+
                 Ok(text)
-            },
-            Err(e) => Err(e)
+            }
+            Err(e) => Err(e),
         }
     }
 
@@ -227,22 +225,25 @@ impl PostResolver {
         )
         .fetch_optional(&self.db_pool)
         .await?;
-        
+
         if let Some(row) = row {
             return Ok(Some((row.uri, row.text)));
         }
-        
+
         Ok(None)
     }
 
     // Update memory cache with new post info
     async fn update_memory_cache(&self, uri: String, text: String) {
         let mut cache = self.memory_cache.write().await;
-        cache.insert(uri.clone(), CachedPostInfo {
-            uri,
-            text,
-            expires_at: Instant::now() + self.ttl,
-        });
+        cache.insert(
+            uri.clone(),
+            CachedPostInfo {
+                uri,
+                text,
+                expires_at: Instant::now() + self.ttl,
+            },
+        );
     }
 
     // Update both caches with new post info
@@ -262,10 +263,10 @@ impl PostResolver {
         )
         .execute(&self.db_pool)
         .await?;
-        
+
         // Update memory cache
         self.update_memory_cache(uri, text).await;
-        
+
         Ok(())
     }
 
@@ -278,7 +279,7 @@ impl PostResolver {
             circuit_breaker::CircuitState::Open => true,
             _ => false,
         };
-        
+
         if is_open {
             warn!("Circuit breaker open, returning fallback content for batch request");
             let mut results = HashMap::new();
@@ -288,32 +289,35 @@ impl PostResolver {
             return Ok(results);
         }
         drop(circuit_breaker); // Release read lock before we need to write
-        
+
         // Create batch timer for metrics
         let batch_timer = std::time::Instant::now();
-        
+
         // Construct URL for batch request
-        let url = format!("https://{}/xrpc/app.bsky.feed.getPosts", self.bsky_service_url);
-        
+        let url = format!(
+            "https://{}/xrpc/app.bsky.feed.getPosts",
+            self.bsky_service_url
+        );
+
         // Create query parameter with multiple URIs - one parameter per URI
-        let query_params = uris.iter().map(|uri| ("uris", uri.as_str())).collect::<Vec<_>>();
-        
+        let query_params = uris
+            .iter()
+            .map(|uri| ("uris", uri.as_str()))
+            .collect::<Vec<_>>();
+
         // Make the API request
-        let response_result = self.http_client.get(&url)
-            .query(&query_params)
-            .send()
-            .await;
-            
+        let response_result = self.http_client.get(&url).query(&query_params).send().await;
+
         match response_result {
             Ok(response) => {
                 if response.status().is_success() {
                     // Record success with circuit breaker
                     self.api_circuit_breaker.write().await.handle_success();
-                    
+
                     match response.json::<GetPostsResponse>().await {
                         Ok(post_data) => {
                             let mut results = HashMap::new();
-                            
+
                             // Process each post in the response
                             for post in post_data.posts {
                                 // Extract and truncate text
@@ -322,20 +326,22 @@ impl PostResolver {
                                 } else {
                                     post.record.text
                                 };
-                                
+
                                 // Add to results
                                 results.insert(post.uri, text);
                             }
-                            
+
                             // Record batch metrics
                             let elapsed = batch_timer.elapsed().as_secs_f64();
                             info!(
                                 "Batch request for {} URIs completed in {:.2}s, received {} posts",
-                                uris.len(), elapsed, results.len()
+                                uris.len(),
+                                elapsed,
+                                results.len()
                             );
-                            
+
                             Ok(results)
-                        },
+                        }
                         Err(e) => {
                             // Record failure with circuit breaker
                             self.api_circuit_breaker.write().await.handle_failure();
@@ -346,11 +352,11 @@ impl PostResolver {
                     // Record failure with circuit breaker
                     self.api_circuit_breaker.write().await.handle_failure();
                     Err(anyhow::anyhow!(
-                        "Failed to fetch batch posts, status: {}", 
+                        "Failed to fetch batch posts, status: {}",
                         response.status()
                     ))
                 }
-            },
+            }
             Err(e) => {
                 // Record failure with circuit breaker
                 self.api_circuit_breaker.write().await.handle_failure();
@@ -358,7 +364,7 @@ impl PostResolver {
             }
         }
     }
-    
+
     // Individual post fetching as fallback (renamed from original fetch_post_from_network)
     async fn fetch_post_from_network_individual(&self, uri: &str) -> Result<String> {
         // Check if circuit breaker is open
@@ -367,63 +373,85 @@ impl PostResolver {
             circuit_breaker::CircuitState::Open => true,
             _ => false,
         };
-        
+
         if is_open {
-            warn!("Circuit breaker open, returning fallback content for {}", uri);
+            warn!(
+                "Circuit breaker open, returning fallback content for {}",
+                uri
+            );
             return Ok("Content temporarily unavailable".to_string());
         }
         drop(circuit_breaker); // Release read lock before we need to write
-        
+
         // Construct API endpoint for fetching a single post
-        let url = format!("https://{}/xrpc/app.bsky.feed.getPosts", self.bsky_service_url);
-        
+        let url = format!(
+            "https://{}/xrpc/app.bsky.feed.getPosts",
+            self.bsky_service_url
+        );
+
         // Attempt to make the API request
-        let response_result = self.http_client.get(&url)
+        let response_result = self
+            .http_client
+            .get(&url)
             .query(&[("uris", uri)])
             .send()
             .await;
-            
+
         match response_result {
             Ok(response) => {
                 if response.status().is_success() {
                     // Record success with circuit breaker
                     self.api_circuit_breaker.write().await.handle_success();
-                    
+
                     match response.json::<GetPostsResponse>().await {
                         Ok(post_data) => {
                             // Get post text content
-                            let post_text = post_data.posts.get(0)
-                                .ok_or_else(|| anyhow::anyhow!("No posts returned for URI: {}", uri))?
-                                .record.text.clone();
-                                
+                            let post_text = post_data
+                                .posts
+                                .get(0)
+                                .ok_or_else(|| {
+                                    anyhow::anyhow!("No posts returned for URI: {}", uri)
+                                })?
+                                .record
+                                .text
+                                .clone();
+
                             // Truncate if needed - don't want notification body to be too long
                             let truncated_text = if post_text.len() > 140 {
                                 format!("{}...", &post_text[..137])
                             } else {
                                 post_text
                             };
-                            
+
                             Ok(truncated_text)
-                        },
+                        }
                         Err(e) => {
                             // Record failure with circuit breaker
                             self.api_circuit_breaker.write().await.handle_failure();
-                            Err(anyhow::anyhow!("Failed to parse post data for URI {}: {}", uri, e))
+                            Err(anyhow::anyhow!(
+                                "Failed to parse post data for URI {}: {}",
+                                uri,
+                                e
+                            ))
                         }
                     }
                 } else {
                     // Record failure with circuit breaker
                     self.api_circuit_breaker.write().await.handle_failure();
                     Err(anyhow::anyhow!(
-                        "Failed to fetch post, status: {}", 
+                        "Failed to fetch post, status: {}",
                         response.status()
                     ))
                 }
-            },
+            }
             Err(e) => {
                 // Record failure with circuit breaker
                 self.api_circuit_breaker.write().await.handle_failure();
-                Err(anyhow::anyhow!("Failed to fetch post content for URI {}: {}", uri, e))
+                Err(anyhow::anyhow!(
+                    "Failed to fetch post content for URI {}: {}",
+                    uri,
+                    e
+                ))
             }
         }
     }
@@ -448,22 +476,21 @@ impl PostResolver {
                 keep
             });
         }
-        
+
         // Clean database cache
-        let db_result = sqlx::query!(
-            "DELETE FROM post_cache WHERE expires_at <= NOW() RETURNING uri"
-        )
-        .fetch_all(&self.db_pool)
-        .await?;
-        
+        let db_result =
+            sqlx::query!("DELETE FROM post_cache WHERE expires_at <= NOW() RETURNING uri")
+                .fetch_all(&self.db_pool)
+                .await?;
+
         let db_cleaned = db_result.len();
-        
+
         info!(
             memory_cleaned = %memory_cleaned,
             db_cleaned = %db_cleaned,
             "Cleaned expired post cache entries"
         );
-        
+
         Ok(memory_cleaned + db_cleaned)
     }
 
@@ -471,7 +498,7 @@ impl PostResolver {
     async fn run_request_processor(&self) {
         let max_batch_size = 25; // API limit or reasonable maximum
         let max_wait_time = Duration::from_millis(50); // Maximum latency we're willing to accept
-        
+
         loop {
             // Wait for either new requests or timeout
             tokio::select! {
@@ -484,23 +511,23 @@ impl PostResolver {
                         let queue = self.request_queue.lock().await;
                         queue.len()
                     };
-                    
+
                     if queue_len == 0 {
                         continue;
                     }
                 }
             }
-            
+
             // Extract up to max_batch_size requests from the queue
             let requests = {
                 let mut queue = self.request_queue.lock().await;
                 if queue.is_empty() {
                     continue;
                 }
-                
+
                 // Take all requests up to max_batch_size
                 let mut requests = HashMap::new();
-                
+
                 // Use drain_filter to avoid borrowing issues
                 let keys: Vec<String> = queue.keys().cloned().take(max_batch_size).collect();
                 for key in keys {
@@ -508,24 +535,24 @@ impl PostResolver {
                         requests.insert(key, sender);
                     }
                 }
-                
+
                 requests
             };
-            
+
             if requests.is_empty() {
                 continue;
             }
-            
+
             // Record batch size metric
             let batch_size = requests.len() as f64;
             crate::metrics::POST_BATCH_SIZE.observe(batch_size);
-            
-            // Log batch size 
+
+            // Log batch size
             info!("Processing batch of {} post requests", batch_size);
-            
+
             // Start batch latency timer
             let batch_timer = std::time::Instant::now();
-            
+
             // Make a batch request
             let uris: Vec<String> = requests.keys().cloned().collect();
             match self.fetch_posts_batch(&uris).await {
@@ -533,23 +560,27 @@ impl PostResolver {
                     // Measure and record batch latency
                     let elapsed = batch_timer.elapsed().as_secs_f64();
                     crate::metrics::POST_BATCH_LATENCY.observe(elapsed);
-                    
+
                     info!(
                         "Batch request for {} URIs completed in {:.2}s, received {} posts",
-                        batch_size, elapsed, results.len()
+                        batch_size,
+                        elapsed,
+                        results.len()
                     );
-                    
+
                     // Update caches for all results asynchronously
                     let self_clone = self.clone();
                     let results_clone = results.clone();
                     tokio::spawn(async move {
                         for (uri, text) in &results_clone {
-                            if let Err(e) = self_clone.update_caches(uri.clone(), text.clone()).await {
+                            if let Err(e) =
+                                self_clone.update_caches(uri.clone(), text.clone()).await
+                            {
                                 warn!("Failed to update cache for {}: {}", uri, e);
                             }
                         }
                     });
-                    
+
                     // Respond to all requesters - move senders to avoid borrowing issues
                     for (uri, sender) in requests {
                         if let Some(text) = results.get(&uri) {
@@ -559,12 +590,17 @@ impl PostResolver {
                             let self_clone = self.clone();
                             let uri_clone = uri.clone();
                             tokio::spawn(async move {
-                                match self_clone.fetch_post_from_network_individual(&uri_clone).await {
+                                match self_clone
+                                    .fetch_post_from_network_individual(&uri_clone)
+                                    .await
+                                {
                                     Ok(text) => {
                                         // Also update caches
-                                        let _ = self_clone.update_caches(uri_clone.clone(), text.clone()).await;
+                                        let _ = self_clone
+                                            .update_caches(uri_clone.clone(), text.clone())
+                                            .await;
                                         let _ = sender.send(Ok(text));
-                                    },
+                                    }
                                     Err(e) => {
                                         let _ = sender.send(Err(e));
                                     }
@@ -572,25 +608,30 @@ impl PostResolver {
                             });
                         }
                     }
-                },
+                }
                 Err(e) => {
                     // Record batch latency even for errors
                     let elapsed = batch_timer.elapsed().as_secs_f64();
                     crate::metrics::POST_BATCH_LATENCY.observe(elapsed);
-                    
+
                     warn!("Batch request failed: {}", e);
-                    
+
                     // Fall back to individual requests for all items
                     for (uri, sender) in requests {
                         let self_clone = self.clone();
                         let uri_clone = uri.clone();
                         tokio::spawn(async move {
-                            match self_clone.fetch_post_from_network_individual(&uri_clone).await {
+                            match self_clone
+                                .fetch_post_from_network_individual(&uri_clone)
+                                .await
+                            {
                                 Ok(text) => {
                                     // Also update caches
-                                    let _ = self_clone.update_caches(uri_clone.clone(), text.clone()).await;
+                                    let _ = self_clone
+                                        .update_caches(uri_clone.clone(), text.clone())
+                                        .await;
                                     let _ = sender.send(Ok(text));
-                                },
+                                }
                                 Err(e) => {
                                     let _ = sender.send(Err(e));
                                 }

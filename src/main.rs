@@ -1,28 +1,30 @@
 mod api;
 mod apns;
+mod app_attest;
 mod config;
 mod crypto; // Add the new crypto module
 mod db;
+mod did_resolver;
 mod filter;
 mod firehose;
 mod logging;
+mod metrics;
 mod models;
+mod post_resolver;
+mod relationship_manager;
 mod stream;
 mod subscription;
-mod did_resolver;
-mod post_resolver;
-mod metrics;
-mod relationship_manager;
 
-use tracing::error;
 use anyhow::Result;
+use app_attest::AppAttestService;
+use relationship_manager::RelationshipManager;
 use std::sync::Arc;
 use tokio::{
     signal,
     sync::{mpsc, oneshot},
 };
+use tracing::error;
 use tracing::info;
-use relationship_manager::RelationshipManager;
 
 fn main() -> Result<()> {
     // Build custom runtime with explicit thread configuration
@@ -30,15 +32,15 @@ fn main() -> Result<()> {
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or_else(num_cpus::get);
-        
+
     println!("Starting with {} Tokio worker threads", worker_threads);
-    
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(worker_threads)
         .enable_all()
         .build()
         .unwrap();
-    
+
     runtime.block_on(async {
         // Initialize logging first thing
         logging::setup_logging();
@@ -57,11 +59,16 @@ fn main() -> Result<()> {
         // Initialize relationship manager with moka cache
         let relationship_manager = Arc::new(RelationshipManager::new(db_pool.clone()));
 
+        let app_attest_service = Arc::new(AppAttestService::new(
+            config.app_attest_app_id.clone(),
+            config.app_attest_challenge_ttl_secs,
+        ));
+
         // One-time cleanup to fix existing cursor issue
-info!("Running one-time cleanup of firehose cursor table");
-if let Err(e) = db::cleanup_old_cursors(&db_pool, 1).await {
-    error!("Error during one-time cursor cleanup: {}", e);
-}
+        info!("Running one-time cleanup of firehose cursor table");
+        if let Err(e) = db::cleanup_old_cursors(&db_pool, 1).await {
+            error!("Error during one-time cursor cleanup: {}", e);
+        }
 
         // Start background task for relationship cache maintenance
         let relationship_manager_clone = relationship_manager.clone();
@@ -75,7 +82,7 @@ if let Err(e) = db::cleanup_old_cursors(&db_pool, 1).await {
             }
         });
 
-                // Spawn cursor cleanup task
+        // Spawn cursor cleanup task
         let db_pool_clone = db_pool.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(3600)); // hourly
@@ -105,7 +112,8 @@ if let Err(e) = db::cleanup_old_cursors(&db_pool, 1).await {
         let post_resolver = Arc::new(post_resolver::PostResolver::new(
             db_pool.clone(),
             60, // 60 minute TTL
-            std::env::var("BSKY_API_URL").unwrap_or_else(|_| "https://public.api.bsky.app".to_string())
+            std::env::var("BSKY_API_URL")
+                .unwrap_or_else(|_| "https://public.api.bsky.app".to_string()),
         ));
 
         // Start post_resolver cleanup task
@@ -164,15 +172,16 @@ if let Err(e) = db::cleanup_old_cursors(&db_pool, 1).await {
         let api_state = Arc::new(api::ApiState {
             db_pool: db_pool_clone,
             relationship_manager: relationship_manager.clone(), // Add relationship manager
+            app_attest: app_attest_service,
         });
         let api_router = api::create_api_router(api_state);
 
         let api_handle = tokio::spawn(async move {
-            let addr = std::env::var("API_BIND_ADDRESS")
-                .unwrap_or_else(|_| "0.0.0.0:8080".to_string());
-                
+            let addr =
+                std::env::var("API_BIND_ADDRESS").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
+
             info!("Starting API server on {}", addr);
-            
+
             let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
             axum::serve(listener, api_router).await.unwrap();
         });
