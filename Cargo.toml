@@ -5,10 +5,10 @@ edition = "2021"
 
 [dependencies]
 tokio = { version = "1.44", features = ["full"] }
-bsky-sdk = "0.1.16"
-atrium-api = "0.25"
-atrium-repo = "0.1.0"
-atrium-xrpc-client = "0.5"
+bsky-sdk = "0.1.21"
+atrium-api = "0.25.5"
+atrium-repo = "0.1.5"
+atrium-xrpc-client = "0.5.14"
 a2 = "0.10"
 sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "time", "uuid"] }
 serde = { version = "1.0", features = ["derive"] }

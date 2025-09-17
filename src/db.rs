@@ -3,7 +3,7 @@ use sqlx::{postgres::PgPoolOptions, Pool, Postgres, Row};
 use std::collections::HashMap;
 use tracing::info;
 
-use crate::models::{FirehoseCursor, NotificationPreference, UserDevice};
+use crate::models::{ActivitySubscription, FirehoseCursor, NotificationPreference, UserDevice};
 
 pub async fn init_db_pool(database_url: &str) -> Result<Pool<Postgres>> {
     info!("Initializing database connection pool");
@@ -125,7 +125,17 @@ pub async fn get_notification_preferences(
 ) -> Result<NotificationPreference> {
     let preferences = sqlx::query_as::<_, NotificationPreference>(
         r#"
-        SELECT user_id, mentions, replies, likes, follows, reposts, quotes
+        SELECT
+            user_id,
+            mentions,
+            replies,
+            likes,
+            follows,
+            reposts,
+            quotes,
+            via_likes,
+            via_reposts,
+            activity_subscriptions
         FROM notification_preferences
         WHERE user_id = $1
         "#,
@@ -213,6 +223,104 @@ pub async fn cleanup_old_cursors(pool: &Pool<Postgres>, days_to_keep: i32) -> Re
         "#,
         days_to_keep as f64
     )
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+pub async fn list_activity_subscriptions_for_subscriber(
+    pool: &Pool<Postgres>,
+    subscriber_did: &str,
+) -> Result<Vec<ActivitySubscription>> {
+    let subscriptions = sqlx::query_as::<_, ActivitySubscription>(
+        r#"
+        SELECT
+            id,
+            subscriber_did,
+            subject_did,
+            include_posts,
+            include_replies,
+            created_at,
+            updated_at
+        FROM activity_subscriptions
+        WHERE subscriber_did = $1
+        ORDER BY subject_did
+        "#,
+    )
+    .bind(subscriber_did)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(subscriptions)
+}
+
+pub async fn list_activity_subscribers_for_subject(
+    pool: &Pool<Postgres>,
+    subject_did: &str,
+) -> Result<Vec<ActivitySubscription>> {
+    let subscriptions = sqlx::query_as::<_, ActivitySubscription>(
+        r#"
+        SELECT
+            id,
+            subscriber_did,
+            subject_did,
+            include_posts,
+            include_replies,
+            created_at,
+            updated_at
+        FROM activity_subscriptions
+        WHERE subject_did = $1
+        "#,
+    )
+    .bind(subject_did)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(subscriptions)
+}
+
+pub async fn upsert_activity_subscription(
+    pool: &Pool<Postgres>,
+    subscriber_did: &str,
+    subject_did: &str,
+    include_posts: bool,
+    include_replies: bool,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO activity_subscriptions (subscriber_did, subject_did, include_posts, include_replies)
+        VALUES ($1, $2, $3, $4)
+        ON CONFLICT (subscriber_did, subject_did)
+        DO UPDATE
+        SET include_posts = EXCLUDED.include_posts,
+            include_replies = EXCLUDED.include_replies,
+            updated_at = NOW()
+        "#,
+    )
+    .bind(subscriber_did)
+    .bind(subject_did)
+    .bind(include_posts)
+    .bind(include_replies)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+pub async fn delete_activity_subscription(
+    pool: &Pool<Postgres>,
+    subscriber_did: &str,
+    subject_did: &str,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        DELETE FROM activity_subscriptions
+        WHERE subscriber_did = $1 AND subject_did = $2
+        "#,
+    )
+    .bind(subscriber_did)
+    .bind(subject_did)
     .execute(pool)
     .await?;
 

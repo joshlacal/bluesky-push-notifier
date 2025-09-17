@@ -6,8 +6,9 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use crate::{
+    activity_subscription_manager::ActivitySubscriptionManager,
     db,
-    models::{BlueskyEvent, NotificationPayload, NotificationType},
+    models::{ActivitySubscriptionKind, BlueskyEvent, NotificationPayload, NotificationType},
 };
 
 use crate::post_resolver::PostResolver;
@@ -19,6 +20,7 @@ pub async fn run_event_filter(
     did_resolver: Arc<crate::did_resolver::DidResolver>,
     post_resolver: Arc<crate::post_resolver::PostResolver>,
     relationship_manager: Arc<crate::relationship_manager::RelationshipManager>,
+    activity_subscription_manager: Arc<ActivitySubscriptionManager>,
 ) -> Result<()> {
     info!("Starting event filter");
 
@@ -46,47 +48,103 @@ pub async fn run_event_filter(
             }
         }
 
-        // Skip event if author is not registered
-        if !registered_users.contains(&event.author) {
-            // Check if the event is relevant to any registered user
-            if !is_event_relevant_to_users(&event, &registered_users) {
-                continue;
+        let classification = classify_event(&event, &registered_users);
+
+        let is_post_event = event.path.contains("app.bsky.feed.post");
+        let is_reply_post = is_post_event && event.record.get("reply").is_some();
+
+        let mut subscription_targets = Vec::new();
+        if is_post_event {
+            match activity_subscription_manager
+                .list_subscribers_for_subject(&event.author)
+                .await
+            {
+                Ok(subscribers) => {
+                    for sub in subscribers {
+                        if sub.subscriber_did == event.author {
+                            continue;
+                        }
+
+                        if !registered_users.contains(&sub.subscriber_did) {
+                            continue;
+                        }
+
+                        let include = if is_reply_post {
+                            sub.include_replies
+                        } else {
+                            sub.include_posts
+                        };
+
+                        if include {
+                            subscription_targets.push(sub.subscriber_did);
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!(
+                        author = %event.author,
+                        error = %e,
+                        "Failed to fetch activity subscription targets"
+                    );
+                }
             }
         }
 
-        // Determine notification type and extract relevant user DIDs
-        if let Some((notification_type, relevant_dids)) = classify_event(&event, &registered_users)
-        {
-            // Get all DIDs we need to resolve: author + all relevant recipients
+        let mut notification_batches: Vec<(NotificationType, Vec<String>)> = Vec::new();
+
+        if let Some((notification_type, relevant_dids)) = classification {
+            if !relevant_dids.is_empty() {
+                notification_batches.push((notification_type, relevant_dids));
+            }
+        }
+
+        if !subscription_targets.is_empty() {
+            subscription_targets.sort();
+            subscription_targets.dedup();
+
+            let kind = if is_reply_post {
+                ActivitySubscriptionKind::Reply
+            } else {
+                ActivitySubscriptionKind::Post
+            };
+
+            notification_batches.push((
+                NotificationType::ActivitySubscription(kind),
+                subscription_targets,
+            ));
+        }
+
+        if notification_batches.is_empty() {
+            continue;
+        }
+
+        for (notification_type, relevant_dids) in notification_batches {
+            if relevant_dids.is_empty() {
+                continue;
+            }
+
             let mut dids_to_resolve = Vec::new();
             dids_to_resolve.push(event.author.clone());
             dids_to_resolve.extend(relevant_dids.clone());
 
-            // Resolve all handles at once
             let handle_map = did_resolver.get_handles_bulk(&dids_to_resolve).await;
 
-            // Fetch devices for all relevant DIDs in one batch operation
             let devices_map = match db::get_user_devices_batch(&db_pool, &relevant_dids).await {
                 Ok(map) => map,
                 Err(e) => {
                     error!("Failed to batch fetch user devices: {}", e);
-                    continue; // Skip to next event
+                    continue;
                 }
             };
 
-            // Process each relevant DID
             let mut notification_futures = Vec::new();
+
             for did in &relevant_dids {
-                // Add this check to skip self-notifications
                 if did == &event.author {
-                    debug!(
-                        recipient = %did,
-                        "Skipping self-notification"
-                    );
+                    debug!(recipient = %did, "Skipping self-notification");
                     continue;
                 }
 
-                // Check if the target has muted or blocked the author
                 if relationship_manager.is_muted(did, &event.author).await {
                     debug!(
                         recipient = %did,
@@ -106,7 +164,6 @@ pub async fn run_event_filter(
                 }
 
                 if let Some(devices) = devices_map.get(did) {
-                    // Process devices for this DID
                     for device in devices {
                         let db_pool = db_pool.clone();
                         let device = device.clone();
@@ -118,10 +175,8 @@ pub async fn run_event_filter(
                         let did = did.clone();
 
                         notification_futures.push(async move {
-                            // Get user preferences
                             match db::get_notification_preferences(&db_pool, device.id).await {
                                 Ok(prefs) => {
-                                    // Check if user wants this notification type
                                     let should_notify = match &notification_type {
                                         NotificationType::Mention => prefs.mentions,
                                         NotificationType::Reply => prefs.replies,
@@ -129,25 +184,44 @@ pub async fn run_event_filter(
                                         NotificationType::Follow => prefs.follows,
                                         NotificationType::Repost => prefs.reposts,
                                         NotificationType::Quote => prefs.quotes,
+                                        NotificationType::ViaLike => prefs.via_likes,
+                                        NotificationType::ViaRepost => prefs.via_reposts,
+                                        NotificationType::ActivitySubscription(_) => {
+                                            prefs.activity_subscriptions
+                                        }
                                     };
 
                                     if should_notify {
-                                        // Create notification content with handle map and post resolver
                                         match create_notification_content(
                                             &handle_map,
                                             &notification_type,
                                             &event,
-                                            &post_resolver
-                                        ).await {
+                                            &post_resolver,
+                                        )
+                                        .await
+                                        {
                                             Ok((title, body, uri)) => {
-                                                // Prepare notification payload with additional data
                                                 let mut data = HashMap::new();
-
                                                 data.insert("did".to_string(), did.clone());
-                                                // Add URI to data for deep linking
+                                                data.insert(
+                                                    "author".to_string(),
+                                                    event.author.clone(),
+                                                );
+                                                data.insert("cid".to_string(), event.cid.clone());
+                                                data.insert(
+                                                    "type".to_string(),
+                                                    format!("{:?}", notification_type),
+                                                );
+
                                                 if let Some(uri_str) = &uri {
                                                     data.insert("uri".to_string(), uri_str.clone());
-                                                    data.insert("type".to_string(), format!("{:?}", notification_type));
+                                                }
+
+                                                if let NotificationType::ActivitySubscription(kind) = &notification_type {
+                                                    data.insert(
+                                                        "subscriptionType".to_string(),
+                                                        kind.as_reason().to_string(),
+                                                    );
                                                 }
 
                                                 let payload = NotificationPayload {
@@ -156,10 +230,9 @@ pub async fn run_event_filter(
                                                     notification_type: notification_type.clone(),
                                                     title,
                                                     body,
-                                                    data, // Now contains URI and type for deep linking
+                                                    data,
                                                 };
 
-                                                // Add backpressure detection
                                                 let remaining_capacity = notification_sender.capacity();
                                                 if remaining_capacity == 0 {
                                                     warn!(
@@ -167,38 +240,48 @@ pub async fn run_event_filter(
                                                         format!("{:?}", notification_type).to_lowercase()
                                                     );
 
-                                                    // Prioritize important notifications
-                                                    if !matches!(notification_type, NotificationType::Follow | NotificationType::Reply | NotificationType::Mention) {
+                                                    if !matches!(
+                                                        notification_type,
+                                                        NotificationType::Follow
+                                                            | NotificationType::Reply
+                                                            | NotificationType::Mention
+                                                            | NotificationType::ActivitySubscription(_)
+                                                    ) {
                                                         warn!("Skipping low-priority notification due to system load");
                                                         return;
                                                     }
 
-                                                    // Brief delay to allow system to catch up
-                                                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                                                    tokio::time::sleep(
+                                                        tokio::time::Duration::from_millis(100),
+                                                    )
+                                                    .await;
                                                 }
 
-                                                // Send with timeout to avoid blocking indefinitely
                                                 match tokio::time::timeout(
                                                     tokio::time::Duration::from_secs(3),
-                                                    notification_sender.send(payload)
-                                                ).await {
+                                                    notification_sender.send(payload),
+                                                )
+                                                .await
+                                                {
                                                     Ok(Ok(_)) => {
                                                         crate::metrics::NOTIFICATIONS_SENT.inc();
-                                                    },
+                                                    }
                                                     Ok(Err(e)) => {
                                                         error!("Failed to send notification to queue: {}", e);
-                                                    },
+                                                    }
                                                     Err(_) => {
-                                                        error!("Timeout when sending notification to queue - system overloaded");
+                                                        error!(
+                                                            "Timeout when sending notification to queue - system overloaded"
+                                                        );
                                                     }
                                                 }
-                                            },
+                                            }
                                             Err(e) => {
                                                 error!("Failed to create notification content: {}", e);
                                             }
                                         }
                                     }
-                                },
+                                }
                                 Err(e) => {
                                     error!("Failed to get notification preferences: {}", e);
                                 }
@@ -208,7 +291,6 @@ pub async fn run_event_filter(
                 }
             }
 
-            // Execute all notification processing in parallel
             futures::future::join_all(notification_futures).await;
         }
 
@@ -219,162 +301,6 @@ pub async fn run_event_filter(
 
     info!("Event filter stopped");
     Ok(())
-}
-
-fn is_event_relevant_to_users(event: &BlueskyEvent, users: &[String]) -> bool {
-    // Only debug log for specific types
-    let event_type = if event.path.contains("app.bsky.feed.post") {
-        "post"
-    } else if event.path.contains("app.bsky.feed.like") {
-        "like"
-    } else if event.path.contains("app.bsky.feed.repost") {
-        "repost"
-    } else if event.path.contains("app.bsky.graph.follow") {
-        "follow"
-    } else {
-        "other"
-    };
-
-    // Handle follows differently - subject is a direct DID string
-    if event.path.contains("app.bsky.graph.follow") {
-        if let Some(subject) = event.record.get("subject").and_then(|s| s.as_str()) {
-            for user in users {
-                if subject == user {
-                    info!(
-                        type = %event_type,
-                        user = %user,
-                        "Found relevant follow for user"
-                    );
-                    return true;
-                }
-            }
-        }
-        return false;
-    }
-
-    // Handle likes and reposts - subject is an object with a URI
-    if event.path.contains("app.bsky.feed.like") || event.path.contains("app.bsky.feed.repost") {
-        if let Some(subject) = event.record.get("subject").and_then(|s| s.as_object()) {
-            if let Some(uri) = subject.get("uri").and_then(|u| u.as_str()) {
-                for user in users {
-                    if uri.contains(user) {
-                        info!(
-                            type = %event_type,
-                            user = %user,
-                            "Found relevant {} for user in URI",
-                            event_type
-                        );
-                        return true;
-                    }
-                }
-            }
-        }
-    }
-
-    // For posts, check: 1) facets for mentions, 2) reply chains, 3) quote posts
-    if event.path.contains("app.bsky.feed.post") {
-        // 1. Check facets for mentions (proper method)
-        if let Some(facets) = event.record.get("facets").and_then(|f| f.as_array()) {
-            for facet in facets {
-                if let Some(features) = facet.get("features").and_then(|f| f.as_array()) {
-                    for feature in features {
-                        // Look for mention features
-                        if let Some(feature_type) = feature.get("$type").and_then(|t| t.as_str()) {
-                            if feature_type == "app.bsky.richtext.facet#mention" {
-                                if let Some(did) = feature.get("did").and_then(|d| d.as_str()) {
-                                    for user in users {
-                                        if did == user {
-                                            info!(
-                                                user = %user,
-                                                "Found mention of user in post facets"
-                                            );
-                                            return true;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // 2. Check for replies to registered users
-        if let Some(reply) = event.record.get("reply").and_then(|r| r.as_object()) {
-            if let Some(parent) = reply.get("parent").and_then(|p| p.as_object()) {
-                if let Some(uri) = parent.get("uri").and_then(|u| u.as_str()) {
-                    for user in users {
-                        if uri.contains(user) {
-                            info!(
-                                user = %user,
-                                "Found reply to user's post"
-                            );
-                            return true;
-                        }
-                    }
-                }
-            }
-        }
-
-        // 3. NEW: Check for quote posts (app.bsky.embed.record)
-        if let Some(embed) = event.record.get("embed") {
-            // Direct record embedding
-            if let Some(embed_obj) = embed.get("record") {
-                if is_quote_of_users(embed_obj, users) {
-                    return true;
-                }
-            }
-
-            // Check for record with media
-            if let Some(_media_obj) = embed.get("media") {
-                // For recordWithMedia, the record is in a separate field
-                if let Some(record_obj) = embed.get("record") {
-                    if is_quote_of_users(record_obj, users) {
-                        return true;
-                    }
-                }
-            }
-
-            // Check for $type-based embeds (alternative structure)
-            if let Some(embed_type) = embed.get("$type").and_then(|t| t.as_str()) {
-                match embed_type {
-                    "app.bsky.embed.record" => {
-                        if let Some(record) = embed.get("record") {
-                            if is_quote_of_users(record, users) {
-                                return true;
-                            }
-                        }
-                    }
-                    "app.bsky.embed.recordWithMedia" => {
-                        if let Some(record) = embed.get("record") {
-                            if is_quote_of_users(record, users) {
-                                return true;
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        // 4. Fallback: Check text for @mentions (less accurate but catches some edge cases)
-        if let Some(text) = event.record.get("text").and_then(|t| t.as_str()) {
-            for user in users {
-                // Extract handle from DID
-                let handle = user.split('.').next().unwrap_or(user);
-                if text.contains(&format!("@{}", handle)) {
-                    debug!(
-                        user = %user,
-                        handle = %handle,
-                        "Found potential mention of user in post text (fallback detection)"
-                    );
-                    return true;
-                }
-            }
-        }
-    }
-
-    false
 }
 
 // Helper function to check if an embedded record quotes any of the users
@@ -477,9 +403,14 @@ fn classify_event(
             }
         }
         path if path.contains("app.bsky.feed.like") => {
-            // Extract relevant DIDs for likes
-            let relevant_dids = extract_target_dids(event, registered_users);
-            (NotificationType::Like, relevant_dids)
+            // Check if this is a via like (someone liked a post via someone's repost)
+            if let Some(via_dids) = extract_via_dids(event, registered_users) {
+                (NotificationType::ViaLike, via_dids)
+            } else {
+                // Regular like notification
+                let relevant_dids = extract_target_dids(event, registered_users);
+                (NotificationType::Like, relevant_dids)
+            }
         }
         path if path.contains("app.bsky.graph.follow") => {
             // Extract relevant DIDs for follows
@@ -487,9 +418,14 @@ fn classify_event(
             (NotificationType::Follow, relevant_dids)
         }
         path if path.contains("app.bsky.feed.repost") => {
-            // Extract relevant DIDs for reposts
-            let relevant_dids = extract_target_dids(event, registered_users);
-            (NotificationType::Repost, relevant_dids)
+            // Check if this is a via repost (someone reposted a post via someone's repost)
+            if let Some(via_dids) = extract_via_dids(event, registered_users) {
+                (NotificationType::ViaRepost, via_dids)
+            } else {
+                // Regular repost notification
+                let relevant_dids = extract_target_dids(event, registered_users);
+                (NotificationType::Repost, relevant_dids)
+            }
         }
         _ => return None, // Not a notification-worthy event
     };
@@ -801,6 +737,100 @@ async fn create_notification_content(
                 Some(profile_uri), // Now includes URI for deep linking
             )
         }
+        NotificationType::ViaLike => {
+            // For via likes, get the original post content that was liked
+            if let Some(subject) = event.record.get("subject").and_then(|s| s.as_object()) {
+                if let Some(uri) = subject.get("uri").and_then(|u| u.as_str()) {
+                    match post_resolver.get_post_content(uri).await {
+                        Ok(content) => (
+                            format!("@{} liked a post via your repost", username),
+                            content,
+                            Some(uri.to_string()),
+                        ),
+                        Err(e) => {
+                            warn!(error = %e, "Failed to get original post content for via like");
+                            (
+                                format!("@{} liked a post via your repost", username),
+                                "".to_string(),
+                                Some(uri.to_string()),
+                            )
+                        }
+                    }
+                } else {
+                    (
+                        format!("@{} liked a post via your repost", username),
+                        "".to_string(),
+                        None,
+                    )
+                }
+            } else {
+                (
+                    format!("@{} liked a post via your repost", username),
+                    "".to_string(),
+                    None,
+                )
+            }
+        }
+        NotificationType::ViaRepost => {
+            // For via reposts, get the original post content that was reposted
+            if let Some(subject) = event.record.get("subject").and_then(|s| s.as_object()) {
+                if let Some(uri) = subject.get("uri").and_then(|u| u.as_str()) {
+                    match post_resolver.get_post_content(uri).await {
+                        Ok(content) => (
+                            format!("@{} reposted a post via your repost", username),
+                            content,
+                            Some(uri.to_string()),
+                        ),
+                        Err(e) => {
+                            warn!(error = %e, "Failed to get original post content for via repost");
+                            (
+                                format!("@{} reposted a post via your repost", username),
+                                "".to_string(),
+                                Some(uri.to_string()),
+                            )
+                        }
+                    }
+                } else {
+                    (
+                        format!("@{} reposted a post via your repost", username),
+                        "".to_string(),
+                        None,
+                    )
+                }
+            } else {
+                (
+                    format!("@{} reposted a post via your repost", username),
+                    "".to_string(),
+                    None,
+                )
+            }
+        }
+        NotificationType::ActivitySubscription(kind) => {
+            let post_text = event
+                .record
+                .get("text")
+                .and_then(|t| t.as_str())
+                .unwrap_or("");
+
+            let uri = format!(
+                "at://{}/app.bsky.feed.post/{}",
+                event.author,
+                event.path.split('/').last().unwrap_or("")
+            );
+
+            match kind {
+                ActivitySubscriptionKind::Post => (
+                    format!("@{} posted a new update", username),
+                    post_text.to_string(),
+                    Some(uri),
+                ),
+                ActivitySubscriptionKind::Reply => (
+                    format!("@{} replied to a thread", username),
+                    post_text.to_string(),
+                    Some(uri),
+                ),
+            }
+        }
     };
 
     tracing::debug!(
@@ -813,4 +843,32 @@ async fn create_notification_content(
     );
 
     Ok((title, body, uri))
+}
+
+// Extract DIDs from via field for via notifications
+// The via field points to a repost, and we want to notify the author of that repost
+fn extract_via_dids(event: &BlueskyEvent, registered_users: &[String]) -> Option<Vec<String>> {
+    // Check if the record has a via field
+    if let Some(via) = event.record.get("via") {
+        // The via field should be an object with a uri field pointing to a repost
+        if let Some(via_uri) = via.get("uri").and_then(|u| u.as_str()) {
+            // Extract the DID from the via URI (format: at://did:example/app.bsky.feed.repost/rkey)
+            let via_dids: Vec<String> = registered_users
+                .iter()
+                .filter(|did| via_uri.contains(did.as_str()))
+                .cloned()
+                .collect();
+
+            if !via_dids.is_empty() {
+                debug!(
+                    via_uri = %via_uri,
+                    via_dids_count = via_dids.len(),
+                    "Found via notification recipients"
+                );
+                return Some(via_dids);
+            }
+        }
+    }
+
+    None
 }

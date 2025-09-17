@@ -1,3 +1,4 @@
+mod activity_subscription_manager;
 mod api;
 mod apns;
 mod app_attest;
@@ -15,6 +16,7 @@ mod relationship_manager;
 mod stream;
 mod subscription;
 
+use activity_subscription_manager::ActivitySubscriptionManager;
 use anyhow::Result;
 use app_attest::AppAttestService;
 use relationship_manager::RelationshipManager;
@@ -58,6 +60,9 @@ fn main() -> Result<()> {
 
         // Initialize relationship manager with moka cache
         let relationship_manager = Arc::new(RelationshipManager::new(db_pool.clone()));
+
+        let activity_subscription_manager =
+            Arc::new(ActivitySubscriptionManager::new(db_pool.clone()));
 
         let app_attest_service = Arc::new(AppAttestService::new(
             config.app_attest_app_id.clone(),
@@ -158,6 +163,7 @@ fn main() -> Result<()> {
             did_resolver.clone(),
             post_resolver.clone(),
             relationship_manager.clone(), // Add relationship manager
+            activity_subscription_manager.clone(),
         ));
 
         // Spawn notification sender task
@@ -173,6 +179,7 @@ fn main() -> Result<()> {
             db_pool: db_pool_clone,
             relationship_manager: relationship_manager.clone(), // Add relationship manager
             app_attest: app_attest_service,
+            activity_subscription_manager: activity_subscription_manager.clone(),
         });
         let api_router = api::create_api_router(api_state);
 

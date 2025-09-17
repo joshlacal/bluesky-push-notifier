@@ -30,6 +30,9 @@ pub struct NotificationPreference {
     pub follows: bool,
     pub reposts: bool,
     pub quotes: bool,
+    pub via_likes: bool,
+    pub via_reposts: bool,
+    pub activity_subscriptions: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,6 +43,35 @@ pub enum NotificationType {
     Follow,
     Repost,
     Quote,
+    ViaLike,   // Someone liked a post via your repost
+    ViaRepost, // Someone reposted a post via your repost
+    ActivitySubscription(ActivitySubscriptionKind),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ActivitySubscriptionKind {
+    Post,
+    Reply,
+}
+
+impl ActivitySubscriptionKind {
+    pub fn as_reason(&self) -> &'static str {
+        match self {
+            ActivitySubscriptionKind::Post => "post",
+            ActivitySubscriptionKind::Reply => "reply",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct ActivitySubscription {
+    pub id: Uuid,
+    pub subscriber_did: String,
+    pub subject_did: String,
+    pub include_posts: bool,
+    pub include_replies: bool,
+    pub created_at: OffsetDateTime,
+    pub updated_at: OffsetDateTime,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

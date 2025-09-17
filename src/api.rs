@@ -3,7 +3,7 @@ use axum::{
     extract::{Json, Query, State},
     http::{header, StatusCode},
     response::IntoResponse,
-    routing::{get, post, put},
+    routing::{delete, get, post, put},
     BoxError, // Add BoxError for error handler
     Router,
 };
@@ -17,8 +17,9 @@ use tower::timeout::TimeoutLayer;
 use tower::ServiceBuilder;
 use tracing::{error, info, warn};
 
+use crate::activity_subscription_manager::ActivitySubscriptionManager;
 use crate::app_attest::AppAttestService;
-use crate::models::{NotificationPreference, UserDevice};
+use crate::models::{ActivitySubscription, NotificationPreference, UserDevice};
 use crate::relationship_manager::RelationshipManager;
 
 // Request and response models
@@ -71,6 +72,9 @@ struct PreferencesUpdateRequest {
     follows: bool,
     reposts: bool,
     quotes: bool,
+    via_likes: bool,
+    via_reposts: bool,
+    activity_subscriptions: bool,
 }
 
 #[derive(Serialize)]
@@ -82,6 +86,9 @@ struct PreferencesBody {
     follows: bool,
     reposts: bool,
     quotes: bool,
+    via_likes: bool,
+    via_reposts: bool,
+    activity_subscriptions: bool,
 }
 
 #[derive(Serialize)]
@@ -101,6 +108,31 @@ struct PreferencesResponse {
     next_challenge: ChallengeEnvelope,
 }
 
+#[derive(Serialize)]
+struct ActivitySubscriptionDto {
+    subject_did: String,
+    include_posts: bool,
+    include_replies: bool,
+    updated_at: OffsetDateTime,
+}
+
+impl From<ActivitySubscription> for ActivitySubscriptionDto {
+    fn from(value: ActivitySubscription) -> Self {
+        Self {
+            subject_did: value.subject_did,
+            include_posts: value.include_posts,
+            include_replies: value.include_replies,
+            updated_at: value.updated_at,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct ActivitySubscriptionsResponse {
+    subscriptions: Vec<ActivitySubscriptionDto>,
+    next_challenge: ChallengeEnvelope,
+}
+
 fn error_response(status: StatusCode, message: impl Into<String>) -> axum::response::Response {
     (status, message.into()).into_response()
 }
@@ -116,11 +148,40 @@ struct RelationshipsRequest {
     proof: AppAttestProof,
 }
 
+#[derive(Deserialize)]
+struct ActivitySubscriptionQuery {
+    did: String,
+    device_token: String,
+    #[serde(flatten)]
+    proof: AppAttestProof,
+}
+
+#[derive(Deserialize)]
+struct ActivitySubscriptionUpdateRequest {
+    did: String,
+    device_token: String,
+    subject_did: String,
+    include_posts: bool,
+    include_replies: bool,
+    #[serde(flatten)]
+    proof: AppAttestProof,
+}
+
+#[derive(Deserialize)]
+struct ActivitySubscriptionDeleteRequest {
+    did: String,
+    device_token: String,
+    subject_did: String,
+    #[serde(flatten)]
+    proof: AppAttestProof,
+}
+
 // API state
 pub struct ApiState {
     pub db_pool: Pool<Postgres>,
     pub relationship_manager: Arc<RelationshipManager>,
     pub app_attest: Arc<AppAttestService>,
+    pub activity_subscription_manager: Arc<ActivitySubscriptionManager>,
 }
 
 // Add error handler function for timeouts
@@ -144,6 +205,12 @@ pub fn create_api_router(state: Arc<ApiState>) -> Router {
         .route("/unregister", post(unregister_device))
         .route("/preferences", get(get_preferences))
         .route("/preferences", put(update_preferences))
+        .route("/activity-subscriptions", get(list_activity_subscriptions))
+        .route("/activity-subscriptions", put(upsert_activity_subscription))
+        .route(
+            "/activity-subscriptions",
+            delete(remove_activity_subscription),
+        )
         .route("/health", get(health_check))
         .route("/metrics", get(metrics_endpoint))
         .route("/relationships", put(update_relationships))
@@ -946,7 +1013,17 @@ async fn get_preferences(
 
     let prefs = sqlx::query_as::<_, NotificationPreference>(
         r#"
-        SELECT user_id, mentions, replies, likes, follows, reposts, quotes
+        SELECT
+            user_id,
+            mentions,
+            replies,
+            likes,
+            follows,
+            reposts,
+            quotes,
+            via_likes,
+            via_reposts,
+            activity_subscriptions
         FROM notification_preferences
         WHERE user_id = $1
         "#,
@@ -968,6 +1045,9 @@ async fn get_preferences(
         follows: prefs.follows,
         reposts: prefs.reposts,
         quotes: prefs.quotes,
+        via_likes: prefs.via_likes,
+        via_reposts: prefs.via_reposts,
+        activity_subscriptions: prefs.activity_subscriptions,
     };
 
     Ok(Json(PreferencesResponse {
@@ -977,6 +1057,135 @@ async fn get_preferences(
             expires_at,
         },
     }))
+}
+
+async fn list_activity_subscriptions(
+    axum::extract::State(state): axum::extract::State<Arc<ApiState>>,
+    Query(query): Query<ActivitySubscriptionQuery>,
+) -> Result<Json<ActivitySubscriptionsResponse>, axum::http::StatusCode> {
+    let mut tx = state
+        .db_pool
+        .begin()
+        .await
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let device = sqlx::query_as::<_, UserDevice>(
+        r#"
+        SELECT id, did, device_token, created_at, updated_at,
+               app_attest_key_id,
+               app_attest_public_key,
+               app_attest_receipt,
+               app_attest_counter,
+               app_attest_challenge,
+               app_attest_challenge_expires_at,
+               app_attest_last_verified_at
+        FROM user_devices
+        WHERE device_token = $1 AND did = $2
+        FOR UPDATE
+        "#,
+    )
+    .bind(&query.device_token)
+    .bind(&query.did)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let device = match device {
+        Some(device) => device,
+        None => {
+            tx.rollback().await.ok();
+            return Err(axum::http::StatusCode::NOT_FOUND);
+        }
+    };
+
+    if let Some(key_id) = &device.app_attest_key_id {
+        if key_id != &query.proof.key_id {
+            tx.rollback().await.ok();
+            return Err(axum::http::StatusCode::UNAUTHORIZED);
+        }
+    } else {
+        tx.rollback().await.ok();
+        return Err(axum::http::StatusCode::PRECONDITION_REQUIRED);
+    }
+
+    if let Err(_) = state.app_attest.validate_challenge(
+        device.app_attest_challenge.as_deref(),
+        device.app_attest_challenge_expires_at,
+        &query.proof.challenge,
+    ) {
+        tx.rollback().await.ok();
+        return Err(axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    let public_key = match &device.app_attest_public_key {
+        Some(key) => key.clone(),
+        None => {
+            tx.rollback().await.ok();
+            return Err(axum::http::StatusCode::PRECONDITION_REQUIRED);
+        }
+    };
+
+    let previous_counter = u32::try_from(device.app_attest_counter)
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let assertion = match state.app_attest.verify_assertion(
+        &query.proof.assertion,
+        &query.proof.client_data,
+        &public_key,
+        previous_counter,
+        device.app_attest_challenge.as_deref(),
+        &query.proof.challenge,
+    ) {
+        Ok(result) => result,
+        Err(_) => {
+            tx.rollback().await.ok();
+            return Err(axum::http::StatusCode::UNAUTHORIZED);
+        }
+    };
+
+    let (next_challenge, expires_at) = state.app_attest.issue_challenge();
+
+    sqlx::query(
+        r#"
+        UPDATE user_devices
+        SET app_attest_counter = $1,
+            app_attest_challenge = $2,
+            app_attest_challenge_expires_at = $3,
+            app_attest_last_verified_at = NOW(),
+            updated_at = NOW()
+        WHERE id = $4
+        "#,
+    )
+    .bind(i64::from(assertion.counter))
+    .bind(&next_challenge)
+    .bind(expires_at)
+    .bind(device.id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    tx.commit()
+        .await
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let subscriptions = state
+        .activity_subscription_manager
+        .list_for_subscriber(&query.did)
+        .await
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let payload = ActivitySubscriptionsResponse {
+        subscriptions: subscriptions
+            .into_iter()
+            .map(ActivitySubscriptionDto::from)
+            .collect(),
+        next_challenge: ChallengeEnvelope {
+            challenge: next_challenge,
+            expires_at,
+        },
+    };
+
+    Ok(Json(payload))
 }
 
 async fn update_preferences(
@@ -1149,8 +1358,11 @@ async fn update_preferences(
                 likes = $3,
                 follows = $4,
                 reposts = $5,
-                quotes = $6
-            WHERE user_id = $7
+                quotes = $6,
+                via_likes = $7,
+                via_reposts = $8,
+                activity_subscriptions = $9
+            WHERE user_id = $10
             "#,
         )
         .bind(req.mentions)
@@ -1159,6 +1371,9 @@ async fn update_preferences(
         .bind(req.follows)
         .bind(req.reposts)
         .bind(req.quotes)
+        .bind(req.via_likes)
+        .bind(req.via_reposts)
+        .bind(req.activity_subscriptions)
         .bind(device_id)
         .execute(&mut *tx)
         .await
@@ -1187,7 +1402,425 @@ async fn update_preferences(
             follows: req.follows,
             reposts: req.reposts,
             quotes: req.quotes,
+            via_likes: req.via_likes,
+            via_reposts: req.via_reposts,
+            activity_subscriptions: req.activity_subscriptions,
         },
+        next_challenge: ChallengeEnvelope {
+            challenge: next_challenge,
+            expires_at,
+        },
+    };
+
+    (StatusCode::OK, Json(response)).into_response()
+}
+
+async fn upsert_activity_subscription(
+    axum::extract::State(state): axum::extract::State<Arc<ApiState>>,
+    Json(req): Json<ActivitySubscriptionUpdateRequest>,
+) -> axum::response::Response {
+    if req.subject_did.trim().is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "subject_did is required");
+    }
+
+    let remove_only = !req.include_posts && !req.include_replies;
+
+    let mut tx = match state.db_pool.begin().await {
+        Ok(tx) => tx,
+        Err(e) => {
+            tracing::error!(
+                "Failed to start transaction for activity subscription update: {}",
+                e
+            );
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "database error");
+        }
+    };
+
+    let device = match sqlx::query_as::<_, UserDevice>(
+        r#"
+        SELECT id, did, device_token, created_at, updated_at,
+               app_attest_key_id,
+               app_attest_public_key,
+               app_attest_receipt,
+               app_attest_counter,
+               app_attest_challenge,
+               app_attest_challenge_expires_at,
+               app_attest_last_verified_at
+        FROM user_devices
+        WHERE device_token = $1 AND did = $2
+        FOR UPDATE
+        "#,
+    )
+    .bind(&req.device_token)
+    .bind(&req.did)
+    .fetch_optional(&mut *tx)
+    .await
+    {
+        Ok(Some(device)) => device,
+        Ok(None) => {
+            tx.rollback().await.ok();
+            return error_response(StatusCode::NOT_FOUND, "device not registered");
+        }
+        Err(e) => {
+            tx.rollback().await.ok();
+            tracing::error!(
+                "Failed to fetch device for activity subscription update: {}",
+                e
+            );
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "database error");
+        }
+    };
+
+    if let Some(key_id) = &device.app_attest_key_id {
+        if key_id != &req.proof.key_id {
+            tx.rollback().await.ok();
+            return error_response(StatusCode::UNAUTHORIZED, "app attest key mismatch");
+        }
+    } else {
+        tx.rollback().await.ok();
+        return error_response(
+            StatusCode::PRECONDITION_REQUIRED,
+            "device requires re-attestation",
+        );
+    }
+
+    if let Err(err) = state.app_attest.validate_challenge(
+        device.app_attest_challenge.as_deref(),
+        device.app_attest_challenge_expires_at,
+        &req.proof.challenge,
+    ) {
+        tx.rollback().await.ok();
+        tracing::warn!(
+            "Challenge validation failed for activity subscription update on DID {}: {}",
+            req.did,
+            err
+        );
+        return error_response(StatusCode::UNAUTHORIZED, "invalid or expired challenge");
+    }
+
+    let public_key = match &device.app_attest_public_key {
+        Some(key) => key.clone(),
+        None => {
+            tx.rollback().await.ok();
+            return error_response(
+                StatusCode::PRECONDITION_REQUIRED,
+                "device requires re-attestation",
+            );
+        }
+    };
+
+    let previous_counter = match u32::try_from(device.app_attest_counter) {
+        Ok(value) => value,
+        Err(_) => {
+            tx.rollback().await.ok();
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "invalid counter state");
+        }
+    };
+
+    let assertion = match state.app_attest.verify_assertion(
+        &req.proof.assertion,
+        &req.proof.client_data,
+        &public_key,
+        previous_counter,
+        device.app_attest_challenge.as_deref(),
+        &req.proof.challenge,
+    ) {
+        Ok(result) => result,
+        Err(err) => {
+            tx.rollback().await.ok();
+            tracing::warn!(
+                "App Attest assertion failed for activity subscription update on DID {}: {}",
+                req.did,
+                err
+            );
+            return error_response(StatusCode::UNAUTHORIZED, "invalid app attest assertion");
+        }
+    };
+
+    let (next_challenge, expires_at) = state.app_attest.issue_challenge();
+
+    if let Err(e) = sqlx::query(
+        r#"
+        UPDATE user_devices
+        SET app_attest_counter = $1,
+            app_attest_challenge = $2,
+            app_attest_challenge_expires_at = $3,
+            app_attest_last_verified_at = NOW(),
+            updated_at = NOW()
+        WHERE id = $4
+        "#,
+    )
+    .bind(i64::from(assertion.counter))
+    .bind(&next_challenge)
+    .bind(expires_at)
+    .bind(device.id)
+    .execute(&mut *tx)
+    .await
+    {
+        tx.rollback().await.ok();
+        tracing::error!(
+            "Failed to update device metadata during activity subscription update: {}",
+            e
+        );
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR, "database error");
+    }
+
+    if let Err(e) = tx.commit().await {
+        tracing::error!(
+            "Failed to commit activity subscription update transaction: {}",
+            e
+        );
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR, "database error");
+    }
+
+    let manager = state.activity_subscription_manager.clone();
+
+    let update_result = if remove_only {
+        manager
+            .delete_subscription(&req.did, &req.subject_did)
+            .await
+    } else {
+        manager
+            .upsert_subscription(
+                &req.did,
+                &req.subject_did,
+                req.include_posts,
+                req.include_replies,
+            )
+            .await
+    };
+
+    if let Err(err) = update_result {
+        tracing::error!(
+            "Failed to persist activity subscription change for {} -> {}: {}",
+            req.did,
+            req.subject_did,
+            err
+        );
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR, "database error");
+    }
+
+    let subscriptions = match state
+        .activity_subscription_manager
+        .list_for_subscriber(&req.did)
+        .await
+    {
+        Ok(list) => list,
+        Err(err) => {
+            tracing::error!(
+                "Failed to list activity subscriptions after update for {}: {}",
+                req.did,
+                err
+            );
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "database error");
+        }
+    };
+
+    let response = ActivitySubscriptionsResponse {
+        subscriptions: subscriptions
+            .into_iter()
+            .map(ActivitySubscriptionDto::from)
+            .collect(),
+        next_challenge: ChallengeEnvelope {
+            challenge: next_challenge,
+            expires_at,
+        },
+    };
+
+    (StatusCode::OK, Json(response)).into_response()
+}
+
+async fn remove_activity_subscription(
+    axum::extract::State(state): axum::extract::State<Arc<ApiState>>,
+    Json(req): Json<ActivitySubscriptionDeleteRequest>,
+) -> axum::response::Response {
+    if req.subject_did.trim().is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "subject_did is required");
+    }
+
+    let mut tx = match state.db_pool.begin().await {
+        Ok(tx) => tx,
+        Err(e) => {
+            tracing::error!(
+                "Failed to start transaction for activity subscription removal: {}",
+                e
+            );
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "database error");
+        }
+    };
+
+    let device = match sqlx::query_as::<_, UserDevice>(
+        r#"
+        SELECT id, did, device_token, created_at, updated_at,
+               app_attest_key_id,
+               app_attest_public_key,
+               app_attest_receipt,
+               app_attest_counter,
+               app_attest_challenge,
+               app_attest_challenge_expires_at,
+               app_attest_last_verified_at
+        FROM user_devices
+        WHERE device_token = $1 AND did = $2
+        FOR UPDATE
+        "#,
+    )
+    .bind(&req.device_token)
+    .bind(&req.did)
+    .fetch_optional(&mut *tx)
+    .await
+    {
+        Ok(Some(device)) => device,
+        Ok(None) => {
+            tx.rollback().await.ok();
+            return error_response(StatusCode::NOT_FOUND, "device not registered");
+        }
+        Err(e) => {
+            tx.rollback().await.ok();
+            tracing::error!(
+                "Failed to fetch device for activity subscription removal: {}",
+                e
+            );
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "database error");
+        }
+    };
+
+    if let Some(key_id) = &device.app_attest_key_id {
+        if key_id != &req.proof.key_id {
+            tx.rollback().await.ok();
+            return error_response(StatusCode::UNAUTHORIZED, "app attest key mismatch");
+        }
+    } else {
+        tx.rollback().await.ok();
+        return error_response(
+            StatusCode::PRECONDITION_REQUIRED,
+            "device requires re-attestation",
+        );
+    }
+
+    if let Err(err) = state.app_attest.validate_challenge(
+        device.app_attest_challenge.as_deref(),
+        device.app_attest_challenge_expires_at,
+        &req.proof.challenge,
+    ) {
+        tx.rollback().await.ok();
+        tracing::warn!(
+            "Challenge validation failed for activity subscription removal on DID {}: {}",
+            req.did,
+            err
+        );
+        return error_response(StatusCode::UNAUTHORIZED, "invalid or expired challenge");
+    }
+
+    let public_key = match &device.app_attest_public_key {
+        Some(key) => key.clone(),
+        None => {
+            tx.rollback().await.ok();
+            return error_response(
+                StatusCode::PRECONDITION_REQUIRED,
+                "device requires re-attestation",
+            );
+        }
+    };
+
+    let previous_counter = match u32::try_from(device.app_attest_counter) {
+        Ok(value) => value,
+        Err(_) => {
+            tx.rollback().await.ok();
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "invalid counter state");
+        }
+    };
+
+    let assertion = match state.app_attest.verify_assertion(
+        &req.proof.assertion,
+        &req.proof.client_data,
+        &public_key,
+        previous_counter,
+        device.app_attest_challenge.as_deref(),
+        &req.proof.challenge,
+    ) {
+        Ok(result) => result,
+        Err(err) => {
+            tx.rollback().await.ok();
+            tracing::warn!(
+                "App Attest assertion failed for activity subscription removal on DID {}: {}",
+                req.did,
+                err
+            );
+            return error_response(StatusCode::UNAUTHORIZED, "invalid app attest assertion");
+        }
+    };
+
+    let (next_challenge, expires_at) = state.app_attest.issue_challenge();
+
+    if let Err(e) = sqlx::query(
+        r#"
+        UPDATE user_devices
+        SET app_attest_counter = $1,
+            app_attest_challenge = $2,
+            app_attest_challenge_expires_at = $3,
+            app_attest_last_verified_at = NOW(),
+            updated_at = NOW()
+        WHERE id = $4
+        "#,
+    )
+    .bind(i64::from(assertion.counter))
+    .bind(&next_challenge)
+    .bind(expires_at)
+    .bind(device.id)
+    .execute(&mut *tx)
+    .await
+    {
+        tx.rollback().await.ok();
+        tracing::error!(
+            "Failed to update device metadata during activity subscription removal: {}",
+            e
+        );
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR, "database error");
+    }
+
+    if let Err(e) = tx.commit().await {
+        tracing::error!(
+            "Failed to commit activity subscription removal transaction: {}",
+            e
+        );
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR, "database error");
+    }
+
+    if let Err(err) = state
+        .activity_subscription_manager
+        .delete_subscription(&req.did, &req.subject_did)
+        .await
+    {
+        tracing::error!(
+            "Failed to delete activity subscription for {} -> {}: {}",
+            req.did,
+            req.subject_did,
+            err
+        );
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR, "database error");
+    }
+
+    let subscriptions = match state
+        .activity_subscription_manager
+        .list_for_subscriber(&req.did)
+        .await
+    {
+        Ok(list) => list,
+        Err(err) => {
+            tracing::error!(
+                "Failed to list activity subscriptions after removal for {}: {}",
+                req.did,
+                err
+            );
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "database error");
+        }
+    };
+
+    let response = ActivitySubscriptionsResponse {
+        subscriptions: subscriptions
+            .into_iter()
+            .map(ActivitySubscriptionDto::from)
+            .collect(),
         next_challenge: ChallengeEnvelope {
             challenge: next_challenge,
             expires_at,

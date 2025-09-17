@@ -154,7 +154,7 @@ impl CommitHandler for FirehoseHandler {
                         let event = BlueskyEvent {
                             op: op.action.clone(),
                             path: op.path.clone(),
-                            cid: format!("{:?}", cid_link.0),
+                            cid: cid.to_string(),
                             author: commit.repo.to_string(),
                             record: record_data,
                             timestamp: chrono::Utc::now().timestamp(),
