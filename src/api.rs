@@ -1,3 +1,4 @@
+
 use axum::{
     error_handling::HandleErrorLayer, // Add HandleErrorLayer
     extract::{Json, Query, State},
@@ -94,7 +95,15 @@ struct PreferencesBody {
 #[derive(Serialize)]
 struct ChallengeEnvelope {
     challenge: String,
+    #[serde(with = "time::serde::rfc3339")]
     expires_at: OffsetDateTime,
+}
+
+#[derive(Deserialize)]
+struct ChallengeRequest {
+    did: Option<String>,
+    device_token: Option<String>,
+    force_key_rotation: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -113,6 +122,7 @@ struct ActivitySubscriptionDto {
     subject_did: String,
     include_posts: bool,
     include_replies: bool,
+    #[serde(with = "time::serde::rfc3339")]
     updated_at: OffsetDateTime,
 }
 
@@ -203,7 +213,7 @@ pub fn create_api_router(state: Arc<ApiState>) -> Router {
     Router::new()
         .route("/register", post(register_device))
         .route("/unregister", post(unregister_device))
-        .route("/preferences", get(get_preferences))
+        .route("/preferences", get(get_preferences).post(get_preferences_post))
         .route("/preferences", put(update_preferences))
         .route("/activity-subscriptions", get(list_activity_subscriptions))
         .route("/activity-subscriptions", put(upsert_activity_subscription))
@@ -214,6 +224,7 @@ pub fn create_api_router(state: Arc<ApiState>) -> Router {
         .route("/health", get(health_check))
         .route("/metrics", get(metrics_endpoint))
         .route("/relationships", put(update_relationships))
+        .route("/challenge", get(issue_challenge_get).post(issue_challenge_post))
         .with_state(state)
         // Properly structure middleware stack
         .layer(
@@ -224,6 +235,75 @@ pub fn create_api_router(state: Arc<ApiState>) -> Router {
                 .layer(TimeoutLayer::new(Duration::from_secs(30))), // Apply CORS
                                                                     // .layer(CorsLayer::permissive()),
         )
+}
+
+async fn issue_challenge_get(
+    State(state): State<Arc<ApiState>>,
+    Query(req): Query<ChallengeRequest>,
+) -> impl IntoResponse {
+    issue_challenge_common(state, req).await
+}
+
+async fn issue_challenge_post(
+    State(state): State<Arc<ApiState>>,
+    Json(req): Json<ChallengeRequest>,
+) -> impl IntoResponse {
+    issue_challenge_common(state, req).await
+}
+
+async fn issue_challenge_common(state: Arc<ApiState>, req: ChallengeRequest) -> impl IntoResponse {
+    let (challenge, expires_at) = state.app_attest.issue_challenge();
+
+    if let (Some(did), Some(device_token)) = (req.did, req.device_token) {
+        // Handle force key rotation by clearing existing App Attest data
+        if req.force_key_rotation.unwrap_or(false) {
+            tracing::info!("Force key rotation requested for DID: {}, clearing existing App Attest data", did);
+            
+            // Clear App Attest key and challenge for this device to force fresh attestation
+            if let Err(e) = sqlx::query(
+                r#"
+                UPDATE user_devices
+                SET app_attest_key_id = NULL,
+                    app_attest_challenge = $1,
+                    app_attest_challenge_expires_at = $2,
+                    updated_at = NOW()
+                WHERE did = $3 AND device_token = $4
+                "#,
+            )
+            .bind(&challenge)
+            .bind(expires_at)
+            .bind(&did)
+            .bind(&device_token)
+            .execute(&state.db_pool)
+            .await
+            {
+                tracing::warn!("Failed to clear App Attest data for force rotation: {}", e);
+            }
+        } else {
+            // Best-effort: persist challenge for existing device
+            if let Err(e) = sqlx::query(
+                r#"
+                UPDATE user_devices
+                SET app_attest_challenge = $1,
+                    app_attest_challenge_expires_at = $2,
+                    updated_at = NOW()
+                WHERE did = $3 AND device_token = $4
+                "#,
+            )
+            .bind(&challenge)
+            .bind(expires_at)
+            .bind(did)
+            .bind(device_token)
+            .execute(&state.db_pool)
+            .await
+            {
+                tracing::warn!("Failed to persist challenge for device: {}", e);
+            }
+        }
+    }
+
+    let body = ChallengeEnvelope { challenge, expires_at };
+    (StatusCode::OK, Json(body))
 }
 
 // Handler for the new relationships endpoint
@@ -306,7 +386,7 @@ async fn update_relationships(
     if let Err(err) = state.app_attest.validate_challenge(
         device.app_attest_challenge.as_deref(),
         device.app_attest_challenge_expires_at,
-        &req.proof.challenge,
+        &req.proof.challenge.clone(),
     ) {
         tx.rollback().await.ok();
         tracing::warn!(
@@ -336,14 +416,15 @@ async fn update_relationships(
         }
     };
 
-    let assertion = match state.app_attest.verify_assertion(
-        &req.proof.assertion,
-        &req.proof.client_data,
-        &public_key,
+    let assertion = match verify_assertion_async(
+        &state.app_attest,
+        req.proof.assertion.clone(),
+        req.proof.client_data.clone(),
+        public_key,
         previous_counter,
-        device.app_attest_challenge.as_deref(),
-        &req.proof.challenge,
-    ) {
+        device.app_attest_challenge.clone(),
+        req.proof.challenge.clone(),
+    ).await {
         Ok(result) => result,
         Err(err) => {
             tx.rollback().await.ok();
@@ -428,6 +509,45 @@ async fn update_relationships(
     }
 }
 
+// Helper functions to handle App Attest operations in blocking context
+async fn verify_attestation_async(
+    app_attest: &AppAttestService,
+    attestation_payload: String,
+    challenge: String,
+    key_id: String,
+) -> Result<crate::app_attest::AttestationVerification, anyhow::Error> {
+    let app_attest = app_attest.clone();
+    tokio::task::spawn_blocking(move || {
+        app_attest.verify_attestation(&attestation_payload, &challenge, &key_id)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("Task join error: {}", e))?
+}
+
+async fn verify_assertion_async(
+    app_attest: &AppAttestService,
+    assertion: String,
+    client_data: String,
+    public_key: Vec<u8>,
+    previous_counter: u32,
+    stored_challenge: Option<String>,
+    challenge: String,
+) -> Result<crate::app_attest::AssertionVerification, anyhow::Error> {
+    let app_attest = app_attest.clone();
+    tokio::task::spawn_blocking(move || {
+        app_attest.verify_assertion(
+            &assertion,
+            &client_data,
+            &public_key,
+            previous_counter,
+            stored_challenge.as_deref(),
+            &challenge,
+        )
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("Task join error: {}", e))?
+}
+
 // API handlers
 async fn register_device(
     axum::extract::State(state): axum::extract::State<Arc<ApiState>>,
@@ -490,21 +610,31 @@ async fn register_device(
                 return error_response(StatusCode::UNAUTHORIZED, "app attest key mismatch");
             }
         } else {
-            let _ = tx.rollback().await;
-            tracing::warn!(
-                "Existing device missing App Attest provisioning for DID {}",
+            // Device exists but has no key ID (likely cleared by force rotation)
+            // This is expected after force key rotation - allow new key registration
+            tracing::info!(
+                "Device exists without App Attest key for DID {} - allowing new key registration (likely after force rotation)",
                 req.did
             );
-            return error_response(
-                StatusCode::PRECONDITION_REQUIRED,
-                "device requires re-attestation",
-            );
+
+            // For devices without keys, we need attestations for initial key setup
+            if req.app_attest_attestation.is_none() {
+                let _ = tx.rollback().await;
+                tracing::warn!(
+                    "Device without key missing App Attest attestation for DID {}",
+                    req.did
+                );
+                return error_response(
+                    StatusCode::PRECONDITION_REQUIRED,
+                    "device requires re-attestation",
+                );
+            }
         }
 
         if let Err(e) = state.app_attest.validate_challenge(
             device.app_attest_challenge.as_deref(),
             device.app_attest_challenge_expires_at,
-            &req.proof.challenge,
+            &req.proof.challenge.clone(),
         ) {
             let _ = tx.rollback().await;
             tracing::warn!("Challenge validation failed for DID {}: {}", req.did, e);
@@ -535,14 +665,15 @@ async fn register_device(
             }
         };
 
-        let assertion = match state.app_attest.verify_assertion(
-            &req.proof.assertion,
-            &req.proof.client_data,
-            &public_key,
-            previous_counter,
-            device.app_attest_challenge.as_deref(),
-            &req.proof.challenge,
-        ) {
+        let assertion = match verify_assertion_async(
+            &state.app_attest,
+            req.proof.assertion.clone(),
+            req.proof.client_data.clone(),
+        public_key,
+        previous_counter,
+        device.app_attest_challenge.clone(),
+        req.proof.challenge.clone(),
+        ).await {
             Ok(result) => result,
             Err(err) => {
                 let _ = tx.rollback().await;
@@ -609,11 +740,12 @@ async fn register_device(
         }
     };
 
-    let attestation = match state.app_attest.verify_attestation(
-        attestation_payload,
-        &req.proof.challenge,
-        &req.proof.key_id,
-    ) {
+    let attestation = match verify_attestation_async(
+        &state.app_attest,
+        attestation_payload.clone(),
+        req.proof.challenge.clone(),
+        req.proof.key_id.clone(),
+    ).await {
         Ok(data) => data,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -622,14 +754,15 @@ async fn register_device(
         }
     };
 
-    let assertion = match state.app_attest.verify_assertion(
-        &req.proof.assertion,
-        &req.proof.client_data,
-        &attestation.public_key,
+    let assertion = match verify_assertion_async(
+        &state.app_attest,
+        req.proof.assertion.clone(),
+        req.proof.client_data.clone(),
+        attestation.public_key.clone(),
         0,
         None,
-        &req.proof.challenge,
-    ) {
+        req.proof.challenge.clone(),
+    ).await {
         Ok(result) => result,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -786,7 +919,7 @@ async fn unregister_device(
             if let Err(e) = state.app_attest.validate_challenge(
                 device.app_attest_challenge.as_deref(),
                 device.app_attest_challenge_expires_at,
-                &req.proof.challenge,
+                &req.proof.challenge.clone(),
             ) {
                 let _ = tx.rollback().await;
                 tracing::warn!(
@@ -824,14 +957,15 @@ async fn unregister_device(
                 }
             };
 
-            if let Err(err) = state.app_attest.verify_assertion(
-                &req.proof.assertion,
-                &req.proof.client_data,
-                &public_key,
+            if let Err(err) = verify_assertion_async(
+                &state.app_attest,
+                req.proof.assertion.clone(),
+                req.proof.client_data.clone(),
+                public_key,
                 previous_counter,
-                device.app_attest_challenge.as_deref(),
-                &req.proof.challenge,
-            ) {
+                device.app_attest_challenge.clone(),
+                req.proof.challenge.clone(),
+            ).await {
                 let _ = tx.rollback().await;
                 tracing::warn!(
                     "App Attest assertion failed during unregister for DID {}: {}",
@@ -958,7 +1092,7 @@ async fn get_preferences(
     if let Err(_) = state.app_attest.validate_challenge(
         device.app_attest_challenge.as_deref(),
         device.app_attest_challenge_expires_at,
-        &query.proof.challenge,
+        &query.proof.challenge.clone(),
     ) {
         tx.rollback().await.ok();
         return Err(axum::http::StatusCode::UNAUTHORIZED);
@@ -975,14 +1109,169 @@ async fn get_preferences(
     let previous_counter = u32::try_from(device.app_attest_counter)
         .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let assertion = match state.app_attest.verify_assertion(
-        &query.proof.assertion,
-        &query.proof.client_data,
-        &public_key,
+    let assertion = match verify_assertion_async(
+        &state.app_attest,
+        query.proof.assertion.clone(),
+        query.proof.client_data.clone(),
+        public_key,
         previous_counter,
+        device.app_attest_challenge.clone(),
+        query.proof.challenge.clone(),
+    ).await {
+        Ok(result) => result,
+        Err(_) => {
+            tx.rollback().await.ok();
+            return Err(axum::http::StatusCode::UNAUTHORIZED);
+        }
+    };
+
+    let (next_challenge, expires_at) = state.app_attest.issue_challenge();
+
+    sqlx::query(
+        r#"
+        UPDATE user_devices
+        SET app_attest_counter = $1,
+            app_attest_challenge = $2,
+            app_attest_challenge_expires_at = $3,
+            app_attest_last_verified_at = NOW(),
+            updated_at = NOW()
+        WHERE id = $4
+        "#,
+    )
+    .bind(i64::from(assertion.counter))
+    .bind(&next_challenge)
+    .bind(expires_at)
+    .bind(device.id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let prefs = sqlx::query_as::<_, NotificationPreference>(
+        r#"
+        SELECT
+            user_id,
+            mentions,
+            replies,
+            likes,
+            follows,
+            reposts,
+            quotes,
+            via_likes,
+            via_reposts,
+            activity_subscriptions
+        FROM notification_preferences
+        WHERE user_id = $1
+        "#,
+    )
+    .bind(device.id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    tx.commit()
+        .await
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let body = PreferencesBody {
+        did: query.did,
+        mentions: prefs.mentions,
+        replies: prefs.replies,
+        likes: prefs.likes,
+        follows: prefs.follows,
+        reposts: prefs.reposts,
+        quotes: prefs.quotes,
+        via_likes: prefs.via_likes,
+        via_reposts: prefs.via_reposts,
+        activity_subscriptions: prefs.activity_subscriptions,
+    };
+
+    Ok(Json(PreferencesResponse {
+        preferences: body,
+        next_challenge: ChallengeEnvelope {
+            challenge: next_challenge,
+            expires_at,
+        },
+    }))
+}
+
+async fn get_preferences_post(
+    axum::extract::State(state): axum::extract::State<Arc<ApiState>>,
+    Json(query): Json<PreferencesQuery>,
+) -> Result<Json<PreferencesResponse>, axum::http::StatusCode> {
+    let mut tx = state
+        .db_pool
+        .begin()
+        .await
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let device = sqlx::query_as::<_, UserDevice>(
+        r#"
+        SELECT id, did, device_token, created_at, updated_at,
+               app_attest_key_id,
+               app_attest_public_key,
+               app_attest_receipt,
+               app_attest_counter,
+               app_attest_challenge,
+               app_attest_challenge_expires_at,
+               app_attest_last_verified_at
+        FROM user_devices
+        WHERE device_token = $1 AND did = $2
+        FOR UPDATE
+        "#,
+    )
+    .bind(&query.device_token)
+    .bind(&query.did)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let device = match device {
+        Some(device) => device,
+        None => {
+            tx.rollback().await.ok();
+            return Err(axum::http::StatusCode::NOT_FOUND);
+        }
+    };
+
+    if let Some(key_id) = &device.app_attest_key_id {
+        if key_id != &query.proof.key_id {
+            tx.rollback().await.ok();
+            return Err(axum::http::StatusCode::UNAUTHORIZED);
+        }
+    } else {
+        tx.rollback().await.ok();
+        return Err(axum::http::StatusCode::PRECONDITION_REQUIRED);
+    }
+
+    if let Err(_) = state.app_attest.validate_challenge(
         device.app_attest_challenge.as_deref(),
-        &query.proof.challenge,
+        device.app_attest_challenge_expires_at,
+        &query.proof.challenge.clone(),
     ) {
+        tx.rollback().await.ok();
+        return Err(axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    let public_key = match &device.app_attest_public_key {
+        Some(key) => key.clone(),
+        None => {
+            tx.rollback().await.ok();
+            return Err(axum::http::StatusCode::PRECONDITION_REQUIRED);
+        }
+    };
+
+    let previous_counter = u32::try_from(device.app_attest_counter)
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let assertion = match verify_assertion_async(
+        &state.app_attest,
+        query.proof.assertion.clone(),
+        query.proof.client_data.clone(),
+        public_key,
+        previous_counter,
+        device.app_attest_challenge.clone(),
+        query.proof.challenge.clone(),
+    ).await {
         Ok(result) => result,
         Err(_) => {
             tx.rollback().await.ok();
@@ -1111,7 +1400,7 @@ async fn list_activity_subscriptions(
     if let Err(_) = state.app_attest.validate_challenge(
         device.app_attest_challenge.as_deref(),
         device.app_attest_challenge_expires_at,
-        &query.proof.challenge,
+        &query.proof.challenge.clone(),
     ) {
         tx.rollback().await.ok();
         return Err(axum::http::StatusCode::UNAUTHORIZED);
@@ -1128,14 +1417,15 @@ async fn list_activity_subscriptions(
     let previous_counter = u32::try_from(device.app_attest_counter)
         .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let assertion = match state.app_attest.verify_assertion(
-        &query.proof.assertion,
-        &query.proof.client_data,
-        &public_key,
+    let assertion = match verify_assertion_async(
+        &state.app_attest,
+        query.proof.assertion.clone(),
+        query.proof.client_data.clone(),
+        public_key,
         previous_counter,
-        device.app_attest_challenge.as_deref(),
-        &query.proof.challenge,
-    ) {
+        device.app_attest_challenge.clone(),
+        query.proof.challenge.clone(),
+    ).await {
         Ok(result) => result,
         Err(_) => {
             tx.rollback().await.ok();
@@ -1248,7 +1538,7 @@ async fn update_preferences(
     if let Err(err) = state.app_attest.validate_challenge(
         device.app_attest_challenge.as_deref(),
         device.app_attest_challenge_expires_at,
-        &req.proof.challenge,
+        &req.proof.challenge.clone(),
     ) {
         tx.rollback().await.ok();
         tracing::warn!(
@@ -1278,14 +1568,15 @@ async fn update_preferences(
         }
     };
 
-    let assertion = match state.app_attest.verify_assertion(
-        &req.proof.assertion,
-        &req.proof.client_data,
-        &public_key,
+    let assertion = match verify_assertion_async(
+        &state.app_attest,
+        req.proof.assertion.clone(),
+        req.proof.client_data.clone(),
+        public_key,
         previous_counter,
-        device.app_attest_challenge.as_deref(),
-        &req.proof.challenge,
-    ) {
+        device.app_attest_challenge.clone(),
+        req.proof.challenge.clone(),
+    ).await {
         Ok(result) => result,
         Err(err) => {
             tx.rollback().await.ok();
@@ -1487,7 +1778,7 @@ async fn upsert_activity_subscription(
     if let Err(err) = state.app_attest.validate_challenge(
         device.app_attest_challenge.as_deref(),
         device.app_attest_challenge_expires_at,
-        &req.proof.challenge,
+        &req.proof.challenge.clone(),
     ) {
         tx.rollback().await.ok();
         tracing::warn!(
@@ -1517,14 +1808,15 @@ async fn upsert_activity_subscription(
         }
     };
 
-    let assertion = match state.app_attest.verify_assertion(
-        &req.proof.assertion,
-        &req.proof.client_data,
-        &public_key,
+    let assertion = match verify_assertion_async(
+        &state.app_attest,
+        req.proof.assertion.clone(),
+        req.proof.client_data.clone(),
+        public_key,
         previous_counter,
-        device.app_attest_challenge.as_deref(),
-        &req.proof.challenge,
-    ) {
+        device.app_attest_challenge.clone(),
+        req.proof.challenge.clone(),
+    ).await {
         Ok(result) => result,
         Err(err) => {
             tx.rollback().await.ok();
@@ -1700,7 +1992,7 @@ async fn remove_activity_subscription(
     if let Err(err) = state.app_attest.validate_challenge(
         device.app_attest_challenge.as_deref(),
         device.app_attest_challenge_expires_at,
-        &req.proof.challenge,
+        &req.proof.challenge.clone(),
     ) {
         tx.rollback().await.ok();
         tracing::warn!(
@@ -1730,14 +2022,15 @@ async fn remove_activity_subscription(
         }
     };
 
-    let assertion = match state.app_attest.verify_assertion(
-        &req.proof.assertion,
-        &req.proof.client_data,
-        &public_key,
+    let assertion = match verify_assertion_async(
+        &state.app_attest,
+        req.proof.assertion.clone(),
+        req.proof.client_data.clone(),
+        public_key,
         previous_counter,
-        device.app_attest_challenge.as_deref(),
-        &req.proof.challenge,
-    ) {
+        device.app_attest_challenge.clone(),
+        req.proof.challenge.clone(),
+    ).await {
         Ok(result) => result,
         Err(err) => {
             tx.rollback().await.ok();
