@@ -27,7 +27,12 @@ struct RepoSubscription {
 
 impl RepoSubscription {
     async fn new(bgs: &str, _cursor: Option<String>) -> Result<Self> {
-        let ws_url = format!("wss://{}/xrpc/{}", bgs, NSID);
+        // Strip protocol prefix if present
+        let host = bgs
+            .strip_prefix("https://")
+            .or_else(|| bgs.strip_prefix("http://"))
+            .unwrap_or(bgs);
+        let ws_url = format!("wss://{}/xrpc/{}", host, NSID);
         info!("Connecting to firehose at: {}", ws_url);
 
         let (stream, _) = connect_async(ws_url).await?;
@@ -190,7 +195,13 @@ pub async fn run_firehose_consumer(
     db_pool: Pool<Postgres>,
     mut shutdown: oneshot::Receiver<()>,
 ) -> Result<()> {
+    error!(
+        "DEBUG: run_firehose_consumer function called with URL: {}",
+        bsky_service_url
+    );
+    error!("DEBUG: About to call info! log");
     info!("Starting firehose consumer");
+    error!("DEBUG: After info! log");
 
     // Maximum reconnection attempts
     const MAX_RECONNECTS: u32 = 10;
@@ -199,14 +210,20 @@ pub async fn run_firehose_consumer(
     let mut reconnect_attempts = 0;
 
     'outer: loop {
+        error!("DEBUG: Starting outer loop iteration");
         // Get last cursor from database for resuming
+        error!("DEBUG: About to call get_last_cursor");
         let last_cursor = match db::get_last_cursor(&db_pool).await {
-            Ok(cursor) => cursor,
+            Ok(cursor) => {
+                error!("DEBUG: get_last_cursor succeeded: {:?}", cursor);
+                cursor
+            }
             Err(e) => {
                 error!("Failed to get last cursor: {}", e);
                 None
             }
         };
+        error!("DEBUG: After get_last_cursor");
 
         info!(
             "Connecting to firehose, starting from cursor: {:?}",
@@ -214,8 +231,13 @@ pub async fn run_firehose_consumer(
         );
 
         // Create subscription with retry logic
+        error!(
+            "DEBUG: About to call RepoSubscription::new with URL: {}",
+            bsky_service_url
+        );
         let subscription_result =
             RepoSubscription::new(&bsky_service_url, last_cursor.clone()).await;
+        error!("DEBUG: RepoSubscription::new completed");
 
         let mut subscription = match subscription_result {
             Ok(sub) => sub,

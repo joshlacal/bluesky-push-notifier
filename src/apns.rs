@@ -13,7 +13,13 @@ pub struct ApnsClient {
 }
 
 impl ApnsClient {
-    pub fn new(key_path: &str, key_id: &str, team_id: &str, production: bool) -> Result<Self> {
+    pub fn new(
+        key_path: &str,
+        key_id: &str,
+        team_id: &str,
+        production: bool,
+        topic: &str,
+    ) -> Result<Self> {
         let key_path = Path::new(key_path);
         let _key = std::fs::read(key_path).context(format!(
             "Failed to read APNs key file: {}",
@@ -26,9 +32,8 @@ impl ApnsClient {
             a2::Endpoint::Sandbox
         };
 
-        // Use the topic from config
-        let topic =
-            std::env::var("APNS_TOPIC").context("APNS_TOPIC environment variable not set")?;
+        // Use the provided topic from configuration
+        let topic = topic.to_string();
 
         let config = a2::ClientConfig::new(if production {
             a2::Endpoint::Production

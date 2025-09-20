@@ -67,6 +67,7 @@ fn main() -> Result<()> {
         let app_attest_service = Arc::new(AppAttestService::new(
             config.app_attest_app_id.clone(),
             config.app_attest_challenge_ttl_secs,
+            config.app_attest_production,
         ));
 
         // One-time cleanup to fix existing cursor issue
@@ -114,11 +115,20 @@ fn main() -> Result<()> {
         });
 
         // After initializing did_resolver
+        // Ensure we pass only host to PostResolver (it prefixes https:// itself)
+        let mut bsky_api_host = config.bsky_api_url.clone();
+        if let Some(stripped) = bsky_api_host
+            .strip_prefix("https://")
+            .or_else(|| bsky_api_host.strip_prefix("http://"))
+        {
+            bsky_api_host = stripped.to_string();
+        }
+        bsky_api_host = bsky_api_host.trim_end_matches('/').to_string();
+
         let post_resolver = Arc::new(post_resolver::PostResolver::new(
             db_pool.clone(),
             60, // 60 minute TTL
-            std::env::var("BSKY_API_URL")
-                .unwrap_or_else(|_| "https://public.api.bsky.app".to_string()),
+            bsky_api_host,
         ));
 
         // Start post_resolver cleanup task
@@ -139,6 +149,7 @@ fn main() -> Result<()> {
             &config.apns_key_id,
             &config.apns_team_id,
             config.apns_production,
+            &config.apns_topic,
         )?;
 
         // Create channels for notification pipeline

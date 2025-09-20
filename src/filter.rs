@@ -1,6 +1,6 @@
 use anyhow::Result;
 use sqlx::{Pool, Postgres};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -25,7 +25,8 @@ pub async fn run_event_filter(
     info!("Starting event filter");
 
     // Cache of registered users to avoid frequent DB lookups
-    let mut registered_users = db::get_registered_users(&db_pool).await?;
+    let mut registered_users_vec = db::get_registered_users(&db_pool).await?;
+    let mut registered_users: HashSet<String> = registered_users_vec.iter().cloned().collect();
     let mut last_cache_refresh = std::time::Instant::now();
 
     while let Some(event) = event_receiver.recv().await {
@@ -37,7 +38,8 @@ pub async fn run_event_filter(
         if last_cache_refresh.elapsed().as_secs() > 300 {
             match db::get_registered_users(&db_pool).await {
                 Ok(users) => {
-                    registered_users = users;
+                    registered_users_vec = users;
+                    registered_users = registered_users_vec.iter().cloned().collect();
                     last_cache_refresh = std::time::Instant::now();
                     debug!(
                         "Refreshed registered users cache, count: {}",
@@ -48,13 +50,23 @@ pub async fn run_event_filter(
             }
         }
 
-        let classification = classify_event(&event, &registered_users);
+        // Early exit if no registered users to notify
+        if registered_users.is_empty() {
+            continue;
+        }
+
+        // Quick check - only process notification-relevant events
+        if !is_notification_relevant_event(&event.path) {
+            continue;
+        }
+
+        let classification = classify_event(&event, &registered_users_vec, &registered_users);
 
         let is_post_event = event.path.contains("app.bsky.feed.post");
         let is_reply_post = is_post_event && event.record.get("reply").is_some();
 
         let mut subscription_targets = Vec::new();
-        if is_post_event {
+        if is_post_event && !registered_users.is_empty() {
             match activity_subscription_manager
                 .list_subscribers_for_subject(&event.author)
                 .await
@@ -110,11 +122,11 @@ pub async fn run_event_filter(
 
             notification_batches.push((
                 NotificationType::ActivitySubscription(kind),
-                subscription_targets,
+                subscription_targets.clone(), // Clone here to avoid move
             ));
         }
 
-        if notification_batches.is_empty() {
+        if notification_batches.is_empty() && subscription_targets.is_empty() {
             continue;
         }
 
@@ -136,6 +148,22 @@ pub async fn run_event_filter(
                     continue;
                 }
             };
+
+            // Collect all device IDs for batched preference lookup
+            let all_device_ids: Vec<uuid::Uuid> = devices_map
+                .values()
+                .flatten()
+                .map(|device| device.id)
+                .collect();
+
+            let preferences_map =
+                match db::get_notification_preferences_batch(&db_pool, &all_device_ids).await {
+                    Ok(map) => map,
+                    Err(e) => {
+                        error!("Failed to batch fetch notification preferences: {}", e);
+                        continue;
+                    }
+                };
 
             let mut notification_futures = Vec::new();
 
@@ -165,7 +193,6 @@ pub async fn run_event_filter(
 
                 if let Some(devices) = devices_map.get(did) {
                     for device in devices {
-                        let db_pool = db_pool.clone();
                         let device = device.clone();
                         let notification_type = notification_type.clone();
                         let event = event.clone();
@@ -173,10 +200,11 @@ pub async fn run_event_filter(
                         let post_resolver = post_resolver.clone();
                         let notification_sender = notification_sender.clone();
                         let did = did.clone();
+                        let preferences_map = preferences_map.clone();
 
                         notification_futures.push(async move {
-                            match db::get_notification_preferences(&db_pool, device.id).await {
-                                Ok(prefs) => {
+                            match preferences_map.get(&device.id) {
+                                Some(prefs) => {
                                     let should_notify = match &notification_type {
                                         NotificationType::Mention => prefs.mentions,
                                         NotificationType::Reply => prefs.replies,
@@ -282,8 +310,8 @@ pub async fn run_event_filter(
                                         }
                                     }
                                 }
-                                Err(e) => {
-                                    error!("Failed to get notification preferences: {}", e);
+                                None => {
+                                    error!("Notification preferences not found for device: {}", device.id);
                                 }
                             }
                         });
@@ -301,6 +329,14 @@ pub async fn run_event_filter(
 
     info!("Event filter stopped");
     Ok(())
+}
+
+// Quick check for notification-relevant events to avoid processing irrelevant ones
+fn is_notification_relevant_event(path: &str) -> bool {
+    path.contains("app.bsky.feed.post")
+        || path.contains("app.bsky.feed.like")
+        || path.contains("app.bsky.graph.follow")
+        || path.contains("app.bsky.feed.repost")
 }
 
 // Helper function to check if an embedded record quotes any of the users
@@ -339,7 +375,13 @@ fn is_quote_of_users(record_obj: &serde_json::Value, users: &[String]) -> bool {
 fn classify_event(
     event: &BlueskyEvent,
     registered_users: &[String],
+    registered_users_set: &HashSet<String>,
 ) -> Option<(NotificationType, Vec<String>)> {
+    // Early exit if no registered users to notify
+    if registered_users.is_empty() {
+        return None;
+    }
+
     // Add debug logging to understand record structure for each event type
     debug!(
         path = %event.path,
@@ -362,7 +404,8 @@ fn classify_event(
                         (NotificationType::Reply, relevant_dids)
                     } else {
                         // Check if it might be a mention
-                        let mentioned_dids = extract_mention_dids(event, registered_users);
+                        let mentioned_dids =
+                            extract_mention_dids(event, registered_users, registered_users_set);
                         if !mentioned_dids.is_empty() {
                             (NotificationType::Mention, mentioned_dids)
                         } else {
@@ -371,7 +414,8 @@ fn classify_event(
                     }
                 } else {
                     // Regular post - check for mentions in facets
-                    let mentioned_dids = extract_mention_dids(event, registered_users);
+                    let mentioned_dids =
+                        extract_mention_dids(event, registered_users, registered_users_set);
                     if !mentioned_dids.is_empty() {
                         (NotificationType::Mention, mentioned_dids)
                     } else {
@@ -385,7 +429,8 @@ fn classify_event(
                     (NotificationType::Reply, relevant_dids)
                 } else {
                     // Check if it might be a mention
-                    let mentioned_dids = extract_mention_dids(event, registered_users);
+                    let mentioned_dids =
+                        extract_mention_dids(event, registered_users, registered_users_set);
                     if !mentioned_dids.is_empty() {
                         (NotificationType::Mention, mentioned_dids)
                     } else {
@@ -394,7 +439,8 @@ fn classify_event(
                 }
             } else {
                 // Regular post - check for mentions in facets
-                let mentioned_dids = extract_mention_dids(event, registered_users);
+                let mentioned_dids =
+                    extract_mention_dids(event, registered_users, registered_users_set);
                 if !mentioned_dids.is_empty() {
                     (NotificationType::Mention, mentioned_dids)
                 } else {
@@ -510,8 +556,17 @@ fn extract_quoted_dids(
 }
 
 // Separate function to extract mention DIDs from facets
-fn extract_mention_dids(event: &BlueskyEvent, registered_users: &[String]) -> Vec<String> {
+fn extract_mention_dids(
+    event: &BlueskyEvent,
+    registered_users: &[String],
+    registered_users_set: &HashSet<String>,
+) -> Vec<String> {
     let mut mentioned_dids = Vec::new();
+
+    // Early exit if no registered users or no facets
+    if registered_users.is_empty() {
+        return mentioned_dids;
+    }
 
     if let Some(facets) = event.record.get("facets").and_then(|f| f.as_array()) {
         for facet in facets {
@@ -520,7 +575,7 @@ fn extract_mention_dids(event: &BlueskyEvent, registered_users: &[String]) -> Ve
                     if let Some(feature_type) = feature.get("$type").and_then(|t| t.as_str()) {
                         if feature_type == "app.bsky.richtext.facet#mention" {
                             if let Some(did) = feature.get("did").and_then(|d| d.as_str()) {
-                                if registered_users.contains(&did.to_string())
+                                if registered_users_set.contains(did)
                                     && !mentioned_dids.contains(&did.to_string())
                                 {
                                     mentioned_dids.push(did.to_string());

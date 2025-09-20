@@ -147,6 +147,56 @@ pub async fn get_notification_preferences(
     Ok(preferences)
 }
 
+pub async fn get_notification_preferences_batch(
+    pool: &Pool<Postgres>,
+    user_ids: &[uuid::Uuid],
+) -> Result<HashMap<uuid::Uuid, NotificationPreference>> {
+    if user_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let mut result = HashMap::new();
+
+    // Process in chunks to avoid too many parameters
+    for chunk in user_ids.chunks(10) {
+        let placeholders: Vec<String> = (1..=chunk.len()).map(|i| format!("${}", i)).collect();
+
+        let query = format!(
+            "SELECT user_id, mentions, replies, likes, follows, reposts, quotes, 
+                    via_likes, via_reposts, activity_subscriptions
+             FROM notification_preferences 
+             WHERE user_id IN ({})",
+            placeholders.join(",")
+        );
+
+        let mut q = sqlx::query(&query);
+        for user_id in chunk {
+            q = q.bind(user_id);
+        }
+
+        let rows = q.fetch_all(pool).await?;
+
+        for row in rows {
+            let preference = NotificationPreference {
+                user_id: row.get("user_id"),
+                mentions: row.get("mentions"),
+                replies: row.get("replies"),
+                likes: row.get("likes"),
+                follows: row.get("follows"),
+                reposts: row.get("reposts"),
+                quotes: row.get("quotes"),
+                via_likes: row.get("via_likes"),
+                via_reposts: row.get("via_reposts"),
+                activity_subscriptions: row.get("activity_subscriptions"),
+            };
+
+            result.insert(preference.user_id, preference);
+        }
+    }
+
+    Ok(result)
+}
+
 pub async fn get_last_cursor(pool: &Pool<Postgres>) -> Result<Option<String>> {
     let cursor = sqlx::query_as::<_, FirehoseCursor>(
         r#"

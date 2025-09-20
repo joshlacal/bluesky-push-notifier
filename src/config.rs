@@ -13,6 +13,7 @@ pub struct Config {
     pub apns_production: bool,
     pub app_attest_app_id: String,
     pub app_attest_challenge_ttl_secs: u64,
+    pub app_attest_production: bool,
 }
 
 impl Config {
@@ -36,6 +37,13 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(300),
+            app_attest_production: env::var("APP_ATTEST_PRODUCTION")
+                .map(|v| v == "true")
+                .unwrap_or_else(|_| {
+                    env::var("APNS_PRODUCTION")
+                        .map(|v| v == "true")
+                        .unwrap_or(false)
+                }),
         })
     }
 }
