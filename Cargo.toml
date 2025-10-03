@@ -42,3 +42,6 @@ appattest-rs = "0.1"
 base64 = "0.22"
 rand = "0.8"
 ciborium = "0.2"
+
+[patch.crates-io]
+appattest-rs = { path = "crates/appattest-rs-0.1.0" }

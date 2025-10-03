@@ -63,3 +63,53 @@ The application requires these environment variables:
 - Debug script available at `tools/debug-firehose.sh` for WebSocket connection testing
 - Uses `tracing` for structured logging with configurable levels
 - Includes Prometheus metrics collection in `metrics.rs`
+
+## Current Deployment Status
+
+### Running Services
+You currently have **2** healthy `bluesky-push-notifier` services running:
+
+#### Service 1 - Staging (STG)
+- **PID**: 38023 (main process), 38010 (doppler wrapper)
+- **Port**: 8080
+- **Config**: `stg` (Doppler)
+- **Health**: ✅ Healthy
+- **Command**: `doppler run --config stg -- /home/ubuntu/bluesky-push-notifier/target/release/bluesky-push-notifier`
+- **Domain**: notifications.catbird.blue (production domain)
+
+#### Service 2 - Development (DEV)
+- **PID**: 45136 (main process), 45109 (doppler wrapper)  
+- **Port**: 8081
+- **Config**: `dev` (Doppler)
+- **Health**: ✅ Healthy
+- **Command**: `doppler run --config dev -- /home/ubuntu/bluesky-push-notifier/target/release/bluesky-push-notifier`
+- **Domain**: dev.notifications.catbird.blue
+
+### Nginx Configurations
+
+#### Production: notifications.catbird.blue
+- **Config File**: `/etc/nginx/sites-available/notifications.catbird.blue`
+- **Proxy Target**: `http://localhost:8080` (STG service)
+
+#### Development: dev.notifications.catbird.blue  
+- **Config File**: `/etc/nginx/sites-available/dev.notifications.catbird.blue`
+- **Backup Config**: `/etc/nginx/sites-available/dev.notifications.catbird.blue.backup`
+- **Proxy Target**: `http://localhost:8081` (DEV service)
+
+### Health Status
+- **Port 8080** (STG): ✅ Healthy
+- **Port 8081** (DEV): ✅ Healthy
+
+### Doppler Configurations
+
+Available configs in `bluesky-push-notifier` project:
+- **dev**: Development environment (actively used)
+- **dev_personal**: Personal development environment (unused)
+- **stg**: Staging environment (actively used)
+- **prd**: Production environment (available but not currently deployed)
+
+### Summary
+- ✅ 2 healthy services running on ports 8080 (STG) and 8081 (DEV)
+- ✅ Both services have proper nginx reverse proxy configurations
+- ✅ Both services are using Doppler for environment configuration
+- 📝 Production config exists but not currently deployed

@@ -128,6 +128,7 @@ struct ActivitySubscriptionsResponse {
 const HEADER_APP_ATTEST_KEY_ID: &str = "X-AppAttest-KeyId";
 const HEADER_APP_ATTEST_CHALLENGE: &str = "X-AppAttest-Challenge";
 const HEADER_APP_ATTEST_ASSERTION: &str = "X-AppAttest-Assertion";
+const HEADER_APP_ATTEST_CLIENT_DATA: &str = "X-AppAttest-ClientData";
 const HEADER_APP_ATTEST_BODY_SHA256: &str = "X-AppAttest-BodySHA256";
 const HEADER_APP_ATTEST_ATTESTATION: &str = "X-AppAttest-Attestation";
 
@@ -135,12 +136,26 @@ struct AppAttestRequestProof {
     key_id: String,
     challenge: String,
     assertion: String,
+    client_data: Option<String>,
     body_sha256: Option<Vec<u8>>,
     attestation: Option<String>,
 }
 
 impl AppAttestRequestProof {
     fn from_headers(headers: &axum::http::HeaderMap) -> Result<Self, axum::response::Response> {
+        // Debug log all App Attest headers
+        tracing::debug!("🔍 Received App Attest headers:");
+        for (name, value) in headers.iter() {
+            if name.as_str().starts_with("X-AppAttest") || name.as_str().starts_with("x-appattest")
+            {
+                tracing::debug!(
+                    "🔍   {}: {:?}",
+                    name.as_str(),
+                    value.to_str().unwrap_or("<invalid utf8>")
+                );
+            }
+        }
+
         let key_id = Self::require_header(headers, HEADER_APP_ATTEST_KEY_ID)?;
         let challenge = Self::require_header(headers, HEADER_APP_ATTEST_CHALLENGE)?;
         let assertion = Self::require_header(headers, HEADER_APP_ATTEST_ASSERTION)?;
@@ -206,10 +221,38 @@ impl AppAttestRequestProof {
             None => None,
         };
 
+        let client_data = match headers.get(HEADER_APP_ATTEST_CLIENT_DATA) {
+            Some(value) => {
+                let value_str = value
+                    .to_str()
+                    .map_err(|_| {
+                        error_response(
+                            StatusCode::BAD_REQUEST,
+                            "invalid X-AppAttest-ClientData header encoding",
+                        )
+                    })?
+                    .trim()
+                    .to_string();
+
+                if value_str.is_empty() {
+                    tracing::debug!("🔍 X-AppAttest-ClientData header is empty");
+                    None
+                } else {
+                    tracing::debug!("🔍 X-AppAttest-ClientData received: {}", value_str);
+                    Some(value_str)
+                }
+            }
+            None => {
+                tracing::debug!("🔍 X-AppAttest-ClientData header not present");
+                None
+            }
+        };
+
         Ok(Self {
             key_id,
             challenge,
             assertion,
+            client_data,
             body_sha256,
             attestation,
         })
@@ -283,6 +326,7 @@ async fn authenticate_device_for_request(
     device_token: &str,
     proof: &AppAttestRequestProof,
     client_data_hash: Vec<u8>,
+    request_body: Option<&[u8]>,
 ) -> Result<AuthenticatedDeviceResult, axum::response::Response> {
     let device = match sqlx::query_as::<_, UserDevice>(
         r#"
@@ -366,17 +410,36 @@ async fn authenticate_device_for_request(
         }
     };
 
-    let assertion = match verify_assertion_async(
-        &state.app_attest,
-        proof.assertion.clone(),
-        client_data_hash,
-        public_key,
-        previous_counter,
-        device.app_attest_challenge.clone(),
-        proof.challenge.clone(),
-    )
-    .await
-    {
+    let request_body_vec = request_body.map(|body| body.to_vec());
+    let body_binding_required = proof.body_sha256.is_some();
+
+    let assertion = match if let Some(client_data) = &proof.client_data {
+        // Use new client data verification
+        verify_assertion_async(
+            &state.app_attest,
+            proof.assertion.clone(),
+            client_data.clone(),
+            request_body_vec.clone(),
+            body_binding_required,
+            public_key,
+            previous_counter,
+            device.app_attest_challenge.clone(),
+            proof.challenge.clone(),
+        )
+        .await
+    } else {
+        // Fallback to hash-based verification (old path)
+        verify_assertion_legacy_async(
+            &state.app_attest,
+            proof.assertion.clone(),
+            client_data_hash,
+            public_key,
+            previous_counter,
+            device.app_attest_challenge.clone(),
+            proof.challenge.clone(),
+        )
+        .await
+    } {
         Ok(result) => result,
         Err(err) => {
             tracing::warn!("App Attest assertion failed: {}", err);
@@ -426,6 +489,7 @@ async fn fetch_preferences_with_auth(
     query: PreferencesQuery,
     proof: &AppAttestRequestProof,
     client_data_hash: Vec<u8>,
+    request_body: Option<&[u8]>,
 ) -> axum::response::Response {
     let mut tx = match state.db_pool.begin().await {
         Ok(tx) => tx,
@@ -442,6 +506,7 @@ async fn fetch_preferences_with_auth(
         &query.device_token,
         proof,
         client_data_hash,
+        request_body,
     )
     .await
     {
@@ -743,6 +808,7 @@ async fn update_relationships(
         &req.device_token,
         &proof,
         client_data_hash,
+        Some(body.as_ref()),
     )
     .await
     {
@@ -813,6 +879,34 @@ async fn verify_attestation_async(
 async fn verify_assertion_async(
     app_attest: &AppAttestService,
     assertion: String,
+    client_data: String,
+    request_body: Option<Vec<u8>>,
+    body_binding_required: bool,
+    public_key: Vec<u8>,
+    previous_counter: u32,
+    stored_challenge: Option<String>,
+    challenge: String,
+) -> Result<crate::app_attest::AssertionVerification, anyhow::Error> {
+    let app_attest = app_attest.clone();
+    tokio::task::spawn_blocking(move || {
+        app_attest.verify_assertion_with_client_data(
+            &assertion,
+            &client_data,
+            request_body.as_deref(),
+            body_binding_required,
+            &public_key,
+            previous_counter,
+            stored_challenge.as_deref(),
+            &challenge,
+        )
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("Task join error: {}", e))?
+}
+
+async fn verify_assertion_legacy_async(
+    app_attest: &AppAttestService,
+    assertion: String,
     client_data_hash: Vec<u8>,
     public_key: Vec<u8>,
     previous_counter: u32,
@@ -855,6 +949,12 @@ async fn register_device(
     };
 
     tracing::info!("Registering device for DID: {}", req.did);
+
+    let request_body_vec = if body.is_empty() {
+        None
+    } else {
+        Some(body.to_vec())
+    };
 
     let client_data_hash = match state
         .app_attest
@@ -965,22 +1065,44 @@ async fn register_device(
                 }
             };
 
-            let assertion = match verify_assertion_async(
-                &state.app_attest,
-                proof.assertion.clone(),
-                client_data_hash.clone(),
-                attestation.public_key.clone(),
-                0, // Reset counter for fresh attestation
-                None, // No previous challenge
-                proof.challenge.clone(),
-            )
-            .await
-            {
+            let assertion = match if let Some(client_data) = &proof.client_data {
+                // Use new client data verification
+                verify_assertion_async(
+                    &state.app_attest,
+                    proof.assertion.clone(),
+                    client_data.clone(),
+                    Some(body.as_ref().to_vec()),
+                    attestation.public_key.clone(),
+                    0,    // Reset counter for fresh attestation
+                    None, // No previous challenge
+                    proof.challenge.clone(),
+                )
+                .await
+            } else {
+                // Fallback to hash-based verification (old path)
+                verify_assertion_legacy_async(
+                    &state.app_attest,
+                    proof.assertion.clone(),
+                    client_data_hash.clone(),
+                    attestation.public_key.clone(),
+                    0,    // Reset counter for fresh attestation
+                    None, // No previous challenge
+                    proof.challenge.clone(),
+                )
+                .await
+            } {
                 Ok(result) => result,
                 Err(err) => {
                     let _ = tx.rollback().await;
-                    tracing::warn!("App Attest assertion failed for existing device DID {}: {}", req.did, err);
-                    return error_response(StatusCode::UNAUTHORIZED, "invalid app attest assertion");
+                    tracing::warn!(
+                        "App Attest assertion failed for existing device DID {}: {}",
+                        req.did,
+                        err
+                    );
+                    return error_response(
+                        StatusCode::UNAUTHORIZED,
+                        "invalid app attest assertion",
+                    );
                 }
             };
 
@@ -1071,17 +1193,32 @@ async fn register_device(
             }
         };
 
-        let assertion = match verify_assertion_async(
-            &state.app_attest,
-            proof.assertion.clone(),
-            client_data_hash.clone(),
-            public_key,
-            previous_counter,
-            device.app_attest_challenge.clone(),
-            proof.challenge.clone(),
-        )
-        .await
-        {
+        let assertion = match if let Some(client_data) = &proof.client_data {
+            // Use new client data verification
+            verify_assertion_async(
+                &state.app_attest,
+                proof.assertion.clone(),
+                client_data.clone(),
+                request_body_vec.clone(),
+                public_key,
+                previous_counter,
+                device.app_attest_challenge.clone(),
+                proof.challenge.clone(),
+            )
+            .await
+        } else {
+            // Fallback to hash-based verification (old path)
+            verify_assertion_legacy_async(
+                &state.app_attest,
+                proof.assertion.clone(),
+                client_data_hash.clone(),
+                public_key,
+                previous_counter,
+                device.app_attest_challenge.clone(),
+                proof.challenge.clone(),
+            )
+            .await
+        } {
             Ok(result) => result,
             Err(err) => {
                 let _ = tx.rollback().await;
@@ -1164,17 +1301,32 @@ async fn register_device(
         }
     };
 
-    let assertion = match verify_assertion_async(
-        &state.app_attest,
-        proof.assertion.clone(),
-        client_data_hash,
-        attestation.public_key.clone(),
-        0,
-        None,
-        proof.challenge.clone(),
-    )
-    .await
-    {
+    let assertion = match if let Some(client_data) = &proof.client_data {
+        // Use new client data verification
+        verify_assertion_async(
+            &state.app_attest,
+            proof.assertion.clone(),
+            client_data.clone(),
+            request_body_vec.clone(),
+            attestation.public_key.clone(),
+            0,
+            None,
+            proof.challenge.clone(),
+        )
+        .await
+    } else {
+        // Fallback to hash-based verification (old path)
+        verify_assertion_legacy_async(
+            &state.app_attest,
+            proof.assertion.clone(),
+            client_data_hash,
+            attestation.public_key.clone(),
+            0,
+            None,
+            proof.challenge.clone(),
+        )
+        .await
+    } {
         Ok(result) => result,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -1281,6 +1433,12 @@ async fn unregister_device(
 
     let token_preview = req.device_token.get(..8).unwrap_or(&req.device_token);
     tracing::info!("Unregistering device with token: {}...", token_preview);
+
+    let request_body_vec = if body.is_empty() {
+        None
+    } else {
+        Some(body.to_vec())
+    };
 
     let client_data_hash = match state
         .app_attest
@@ -1399,17 +1557,34 @@ async fn unregister_device(
                 }
             };
 
-            if let Err(err) = verify_assertion_async(
-                &state.app_attest,
-                proof.assertion.clone(),
-                client_data_hash,
-                public_key,
-                previous_counter,
-                device.app_attest_challenge.clone(),
-                proof.challenge.clone(),
-            )
-            .await
-            {
+            let assertion_result = if let Some(client_data) = &proof.client_data {
+                // Use new client data verification
+                verify_assertion_async(
+                    &state.app_attest,
+                    proof.assertion.clone(),
+                    client_data.clone(),
+                    request_body_vec.clone(),
+                    public_key,
+                    previous_counter,
+                    device.app_attest_challenge.clone(),
+                    proof.challenge.clone(),
+                )
+                .await
+            } else {
+                // Fallback to hash-based verification (old path)
+                verify_assertion_legacy_async(
+                    &state.app_attest,
+                    proof.assertion.clone(),
+                    client_data_hash,
+                    public_key,
+                    previous_counter,
+                    device.app_attest_challenge.clone(),
+                    proof.challenge.clone(),
+                )
+                .await
+            };
+
+            if let Err(err) = assertion_result {
                 let _ = tx.rollback().await;
                 tracing::warn!(
                     "App Attest assertion failed during unregister for DID {}: {}",
@@ -1516,7 +1691,7 @@ async fn get_preferences(
         }
     };
 
-    fetch_preferences_with_auth(state, query, &proof, client_data_hash).await
+    fetch_preferences_with_auth(state, query, &proof, client_data_hash, None).await
 }
 
 async fn get_preferences_post(
@@ -1553,7 +1728,7 @@ async fn get_preferences_post(
         }
     };
 
-    fetch_preferences_with_auth(state, query, &proof, client_data_hash).await
+    fetch_preferences_with_auth(state, query, &proof, client_data_hash, Some(body.as_ref())).await
 }
 
 async fn list_activity_subscriptions(
@@ -1606,6 +1781,7 @@ async fn list_activity_subscriptions(
         &query.device_token,
         &proof,
         client_data_hash,
+        None,
     )
     .await
     {
@@ -1706,6 +1882,7 @@ async fn list_activity_subscriptions_post(
         &query.device_token,
         &proof,
         client_data_hash,
+        Some(body.as_ref()),
     )
     .await
     {
@@ -1803,6 +1980,7 @@ async fn update_preferences(
         &req.device_token,
         &proof,
         client_data_hash,
+        Some(body.as_ref()),
     )
     .await
     {
@@ -1960,6 +2138,7 @@ async fn upsert_activity_subscription(
         &req.device_token,
         &proof,
         client_data_hash,
+        Some(body.as_ref()),
     )
     .await
     {
@@ -2091,6 +2270,7 @@ async fn remove_activity_subscription(
         &req.device_token,
         &proof,
         client_data_hash,
+        Some(body.as_ref()),
     )
     .await
     {

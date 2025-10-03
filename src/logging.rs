@@ -1,23 +1,39 @@
 use std::env;
 use tracing_subscriber::{fmt, EnvFilter};
 
-pub fn setup_logging() {
-    // Check for a LOG_LEVEL environment variable, defaulting to INFO
-    let log_level = env::var("LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
+fn build_default_filter() -> EnvFilter {
+    let base_level = env::var("LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
 
-    // Create a custom filter that limits verbose components
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        // Default filter configuration to reduce noise
-        EnvFilter::new(format!("bluesky_push_notifier={}", log_level))
-            // Set firehose and other noisy modules to WARNING level unless explicitly configured
-            .add_directive("bluesky_push_notifier::firehose=warn".parse().unwrap())
-            // Keep API and notification delivery at INFO level
-            .add_directive("bluesky_push_notifier::api=info".parse().unwrap())
-            .add_directive("bluesky_push_notifier::apns=info".parse().unwrap())
-            // Reduce noise from third-party libraries
-            .add_directive("tower_http=warn".parse().unwrap())
-            .add_directive("a2=warn".parse().unwrap())
-    });
+    let mut filter = EnvFilter::new(format!("bluesky_push_notifier={base_level}"));
+
+    // Clamp noisy subsystems regardless of the global level.
+    for directive in [
+        "bluesky_push_notifier::api=info",
+        "bluesky_push_notifier::app_attest=debug",
+        "bluesky_push_notifier::firehose=warn",
+        "bluesky_push_notifier::filter=warn",
+        "bluesky_push_notifier::stream=warn",
+        "bluesky_push_notifier::subscription=warn",
+        "sqlx=warn",
+        "tower_http=warn",
+        "a2=warn",
+    ] {
+        filter = filter.add_directive(directive.parse().expect("invalid log directive"));
+    }
+
+    filter
+}
+
+pub fn setup_logging() {
+    let mut filter = build_default_filter();
+
+    if let Ok(extra) = env::var("EXTRA_LOG_DIRECTIVES") {
+        for directive in extra.split(',').map(str::trim).filter(|d| !d.is_empty()) {
+            if let Ok(parsed) = directive.parse() {
+                filter = filter.add_directive(parsed);
+            }
+        }
+    }
 
     // Initialize the subscriber with the filter
     fmt()

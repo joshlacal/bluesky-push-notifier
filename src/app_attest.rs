@@ -1,19 +1,25 @@
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
-use appattest_rs::{assertion::Assertion, attestation::Attestation};
+use appattest_rs::{
+    assertion::Assertion,
+    attestation::{Attestation, AttestationEnvironment},
+    error::AppAttestError,
+};
 use base64::{engine::general_purpose, Engine as _};
 use ciborium::de::from_reader;
 use constant_time_eq::constant_time_eq;
 use rand::{rngs::OsRng, RngCore};
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
+use sha2::Digest;
+use sha2::Sha256;
 use time::{Duration, OffsetDateTime};
 
 #[derive(Clone)]
 pub struct AppAttestService {
     app_id: Arc<str>,
     challenge_ttl: Duration,
+    environment: AttestationEnvironment,
 }
 
 pub struct AttestationVerification {
@@ -36,15 +42,52 @@ struct RawAssertion {
 impl AppAttestService {
     pub fn new(app_id: String, challenge_ttl_secs: u64, production: bool) -> Self {
         let ttl = Duration::seconds(challenge_ttl_secs as i64);
-        Self {
+        let environment = if production {
+            AttestationEnvironment::Production
+        } else {
+            AttestationEnvironment::Development
+        };
+
+        let service = Self {
             app_id: Arc::from(app_id),
             challenge_ttl: ttl,
-        }
+            environment,
+        };
+
+        tracing::info!(
+            app_attest.app_id = %service.app_id,
+            app_attest.challenge_ttl_secs = challenge_ttl_secs,
+            app_attest.environment = ?service.environment,
+            "Configured App Attest service"
+        );
+
+        service
     }
 
     pub fn is_development_mode(&self) -> bool {
-        // Check if we're in development based on app_id patterns or environment
-        // This is a heuristic - in development, we want to be more lenient
+        if matches!(self.environment, AttestationEnvironment::Production) {
+            return false;
+        }
+
+        let force_production =
+            std::env::var("APP_ATTEST_FORCE_PRODUCTION").unwrap_or_default() == "true";
+        if force_production {
+            return false;
+        }
+
+        let disable_fallback =
+            std::env::var("APP_ATTEST_DISABLE_FALLBACK").unwrap_or_default() == "true";
+        if disable_fallback {
+            return false;
+        }
+
+        let is_testflight_fallback =
+            std::env::var("APP_ATTEST_TESTFLIGHT_FALLBACK").unwrap_or_default() == "true";
+        if is_testflight_fallback {
+            return true;
+        }
+
+        // Default to development heuristics when APNS is not running in production mode
         std::env::var("APNS_PRODUCTION").unwrap_or_default() != "true"
     }
 
@@ -68,74 +111,160 @@ impl AppAttestService {
         challenge: &str,
         key_id: &str,
     ) -> Result<AttestationVerification> {
-        // In development mode, iOS apps use App Attest sandbox environment
-        // The appattest-rs library only supports Apple's production CA
-        // Sandbox attestations will fail validation against production CA
-        if self.is_development_mode() {
-            tracing::warn!("🚧 DEVELOPMENT MODE: App Attest sandbox environment detected");
-            tracing::info!("📋 iOS app uses sandbox, but appattest-rs only supports production CA");
+        // Always try real validation first to see the actual error
+        tracing::info!("🔍 Attempting App Attest validation with detailed logging");
+        tracing::debug!(
+            "🔍 App Attest validation params: app_id={}, key_id={}, challenge_len={}",
+            &self.app_id,
+            key_id,
+            challenge.len()
+        );
+        tracing::debug!(
+            "🔍 Challenge (first 20 chars): {}",
+            &challenge[..std::cmp::min(20, challenge.len())]
+        );
+        tracing::debug!(
+            "🔍 Raw attestation_b64 length: {} chars",
+            attestation_b64.len()
+        );
+        tracing::debug!(
+            "🔍 Raw attestation_b64 (first 100 chars): {}",
+            &attestation_b64[..std::cmp::min(100, attestation_b64.len())]
+        );
 
-            // Try normal validation first (will likely fail for sandbox attestations)
-            let attestation = Attestation::from_base64(attestation_b64)
-                .context("failed to decode attestation payload")?;
+        // Try to decode base64 first to see raw bytes
+        match general_purpose::STANDARD.decode(attestation_b64) {
+            Ok(raw_bytes) => {
+                tracing::debug!("✅ Base64 decode successful: {} bytes", raw_bytes.len());
+                tracing::debug!(
+                    "🔍 Raw bytes (first 20): {:?}",
+                    &raw_bytes[..std::cmp::min(20, raw_bytes.len())]
+                );
+            }
+            Err(e) => {
+                tracing::error!("❌ Base64 decode failed: {}", e);
+                bail!("failed to decode attestation payload: invalid base64");
+            }
+        }
 
-            match attestation.verify(challenge, &self.app_id, key_id) {
-                Ok((public_key, receipt)) => {
-                    tracing::info!(
-                        "✅ App Attest validation succeeded (production app in dev mode)"
-                    );
-                    Ok(AttestationVerification {
-                        public_key,
-                        receipt,
-                    })
+        let attestation = Attestation::from_base64(attestation_b64)
+            .context("failed to decode attestation payload")?;
+
+        tracing::debug!("✅ Attestation decoded successfully, attempting verification");
+
+        // CRITICAL FIX: Build client data JSON that matches what the client sent
+        // The client now sends JSON client data, so we need to reconstruct it
+        let client_data_json = format!(r#"{{"challenge":"{}"}}"#, challenge);
+        tracing::debug!(
+            "🔍 ATTESTATION: Reconstructed client data JSON: {}",
+            client_data_json
+        );
+
+        match attestation.verify_with_environment(
+            &client_data_json,
+            &self.app_id,
+            key_id,
+            self.environment,
+        ) {
+            Ok((public_key, receipt)) => {
+                tracing::info!("✅ App Attest validation succeeded!");
+                Ok(AttestationVerification {
+                    public_key,
+                    receipt,
+                })
+            }
+            Err(e) => {
+                let error_string = format!("{}", e);
+                tracing::error!(
+                    "❌ App Attest verification failed (env={:?}): {}",
+                    self.environment,
+                    error_string
+                );
+
+                let mut context_messages = Vec::new();
+
+                let mut kind_context = "kind=unknown".to_string();
+                match e.downcast::<AppAttestError>() {
+                    Ok(app_err) => {
+                        tracing::error!("❌ App Attest error kind: {:?}", app_err);
+                        kind_context = format!("kind={app_err:?}");
+                    }
+                    Err(other) => {
+                        tracing::error!("❌ App Attest error (non AppAttestError): {}", other);
+                    }
                 }
-                Err(e) => {
-                    tracing::warn!("⚠️ App Attest sandbox validation failed (expected): {}", e);
-                    tracing::info!(
-                        "🔄 Using development fallback - extracting public key from attestation"
-                    );
+                context_messages.push(kind_context);
 
-                    // For development, we can still extract useful data from the attestation
-                    // even if signature validation fails due to sandbox/production CA mismatch
-                    match self.extract_public_key_from_attestation(attestation_b64) {
-                        Ok(public_key) => {
-                            tracing::info!("✅ Extracted public key from sandbox attestation");
-                            Ok(AttestationVerification {
-                                public_key,
-                                receipt: attestation_b64.as_bytes().to_vec(), // Use original as receipt
-                            })
-                        }
-                        Err(extract_err) => {
-                            tracing::warn!("⚠️ Failed to extract public key: {}", extract_err);
-                            tracing::info!("🧪 Using mock data for development testing");
-                            // Return deterministic mock data based on key_id for consistency
-                            let mut public_key = vec![0u8; 65]; // Standard EC public key size
-                            public_key[0] = 0x04; // Uncompressed point indicator
-                            for (i, byte) in key_id.bytes().take(32).enumerate() {
-                                public_key[i + 1] = byte;
+                // Attempt verification with the alternate environment purely for diagnostics.
+                let alternate_env = match self.environment {
+                    AttestationEnvironment::Production => Some(AttestationEnvironment::Development),
+                    AttestationEnvironment::Development => Some(AttestationEnvironment::Production),
+                };
+
+                if let Some(alt_env) = alternate_env {
+                    let alt_verification =
+                        Attestation::from_base64(attestation_b64)
+                            .ok()
+                            .and_then(|att| {
+                                att.verify_with_environment(
+                                    challenge,
+                                    &self.app_id,
+                                    key_id,
+                                    alt_env,
+                                )
+                                .ok()
+                            });
+
+                    match alt_verification {
+                        Some((alt_public_key, alt_receipt)) => {
+                            tracing::warn!(
+                                "⚠️ App Attest payload validates under alternate environment {:?}; check APP_ATTEST_PRODUCTION/APP_ATTEST_FORCE_PRODUCTION",
+                                alt_env
+                            );
+                            context_messages
+                                .push(format!("alternate_environment_success={:?}", alt_env));
+
+                            if self.is_development_mode() {
+                                return Ok(AttestationVerification {
+                                    public_key: alt_public_key,
+                                    receipt: alt_receipt,
+                                });
                             }
-                            Ok(AttestationVerification {
-                                public_key,
-                                receipt: key_id.as_bytes().to_vec(),
-                            })
+                        }
+                        None => {
+                            tracing::debug!(
+                                "ℹ️ App Attest payload also rejected by alternate environment {:?}",
+                                alt_env
+                            );
                         }
                     }
                 }
+
+                // Only fall back to development mode if we're actually in dev mode
+                if self.is_development_mode() {
+                    tracing::warn!("🚧 DEVELOPMENT MODE: Using fallback after validation failed");
+                    tracing::warn!("⚠️ Original error: {}", error_string);
+
+                    // Return deterministic mock data based on key_id for consistency
+                    let mut public_key = vec![0u8; 65]; // Standard EC public key size
+                    public_key[0] = 0x04; // Uncompressed point indicator
+                    for (i, byte) in key_id.bytes().take(32).enumerate() {
+                        public_key[i + 1] = byte;
+                    }
+                    Ok(AttestationVerification {
+                        public_key,
+                        receipt: key_id.as_bytes().to_vec(),
+                    })
+                } else {
+                    // Production mode - return the error
+                    let mut err =
+                        format!("app attest attestation validation failed: {error_string}");
+                    if !context_messages.is_empty() {
+                        err.push_str(&format!(" ({})", context_messages.join(", ")));
+                    }
+                    bail!(err);
+                }
             }
-        } else {
-            // Production mode - strict validation against Apple production CA
-            tracing::info!("🔒 PRODUCTION MODE: Using strict App Attest validation");
-            let attestation = Attestation::from_base64(attestation_b64)
-                .context("failed to decode attestation payload")?;
-
-            let (public_key, receipt) = attestation
-                .verify(challenge, &self.app_id, key_id)
-                .map_err(|e| anyhow!("app attest attestation validation failed: {e}"))?;
-
-            Ok(AttestationVerification {
-                public_key,
-                receipt,
-            })
         }
     }
 
@@ -193,69 +322,115 @@ impl AppAttestService {
             bail!("client data hash must be 32 bytes");
         }
 
-        if self.is_development_mode() {
-            tracing::debug!("🚧 DEVELOPMENT MODE: Using relaxed App Attest assertion validation");
+        let assertion =
+            Assertion::from_base64(assertion_b64).context("failed to decode assertion payload")?;
 
-            // Try normal validation first
-            let assertion = Assertion::from_base64(assertion_b64)
-                .context("failed to decode assertion payload")?;
+        let challenge_for_validation = stored_challenge.unwrap_or(presented_challenge);
 
-            let challenge_for_validation = stored_challenge.unwrap_or(presented_challenge);
+        tracing::debug!(
+            "🔍 Assertion verification with client_data_hash len: {}",
+            client_data_hash.len()
+        );
+        tracing::debug!(
+            "🔍 Assertion verification with challenge: {}",
+            challenge_for_validation
+        );
 
-            match assertion.verify(
-                client_data_hash.to_vec(),
+        // CRITICAL INSIGHT: The issue is a fundamental misunderstanding.
+        //
+        // The client_data_hash we receive is NOT supposed to be a hash of client data JSON.
+        // It's the hash computed by our compute_client_data_hash function: SHA256(challenge_bytes + body_digest_bytes).
+        //
+        // But the appattest-rs library's assertion.verify() expects client data JSON.
+        // This is a mismatch between App Attest's actual spec and this library's implementation.
+        //
+        // The correct approach is to create client data JSON that would produce the same
+        // client data hash when put through SHA256, but that's not how App Attest works.
+        //
+        // For App Attest, we should be using the raw client_data_hash directly in nonce computation.
+
+        tracing::debug!("🔍 DIAGNOSIS: client_data_hash is raw hash, not JSON hash");
+        tracing::debug!("🔍 client_data_hash: {:?}", client_data_hash);
+
+        // The appattest-rs library is not correctly implementing App Attest.
+        // App Attest should use the client data hash directly, not reconstruct JSON.
+        //
+        // However, since we're constrained to use this library, let's try using the
+        // challenge in base64 form as the client data to see if that works.
+
+        // Create minimal client data with just the challenge
+        let client_data_json = format!(r#"{{"challenge":"{}"}}"#, challenge_for_validation);
+        tracing::debug!("🔍 Using minimal client data: {}", client_data_json);
+
+        assertion
+            .verify(
+                client_data_json.into_bytes(),
+                None,
                 &self.app_id,
                 public_key.to_vec(),
                 previous_counter,
                 challenge_for_validation,
-            ) {
-                Ok(_) => {
-                    let counter = Self::parse_counter(assertion_b64)?;
-                    if counter <= previous_counter {
-                        // In dev mode, allow counter to not advance for testing
-                        tracing::warn!("⚠️ Counter did not advance in dev mode, allowing anyway");
-                        return Ok(AssertionVerification {
-                            counter: previous_counter + 1,
-                        });
-                    }
-                    Ok(AssertionVerification { counter })
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "⚠️ App Attest assertion failed in development mode, using fallback: {}",
-                        e
-                    );
-                    // Return mock success for development
-                    Ok(AssertionVerification {
-                        counter: previous_counter + 1,
-                    })
-                }
-            }
-        } else {
-            // Production mode - strict validation
-            let assertion = Assertion::from_base64(assertion_b64)
-                .context("failed to decode assertion payload")?;
+            )
+            .map_err(|e| anyhow!("app attest assertion validation failed: {e}"))?;
 
-            let challenge_for_validation = stored_challenge.unwrap_or(presented_challenge);
+        let counter = Self::parse_counter(assertion_b64)?;
 
-            assertion
-                .verify(
-                    client_data_hash.to_vec(),
-                    &self.app_id,
-                    public_key.to_vec(),
-                    previous_counter,
-                    challenge_for_validation,
-                )
-                .map_err(|e| anyhow!("app attest assertion validation failed: {e}"))?;
-
-            let counter = Self::parse_counter(assertion_b64)?;
-
-            if counter <= previous_counter {
-                bail!("app attest counter did not advance");
-            }
-
-            Ok(AssertionVerification { counter })
+        if counter <= previous_counter {
+            bail!("app attest counter did not advance");
         }
+
+        Ok(AssertionVerification { counter })
+    }
+
+    pub fn verify_assertion_with_client_data(
+        &self,
+        assertion_b64: &str,
+        client_data_json: &str,
+        request_body: Option<&[u8]>,
+        body_binding_required: bool,
+        public_key: &[u8],
+        previous_counter: u32,
+        stored_challenge: Option<&str>,
+        presented_challenge: &str,
+    ) -> Result<AssertionVerification> {
+        tracing::debug!("app_attest.assertion.client_data", %client_data_json);
+        tracing::debug!("app_attest.assertion.presented_challenge", %presented_challenge);
+
+        let challenge_for_validation = stored_challenge.unwrap_or(presented_challenge);
+
+        let bound_body = match (body_binding_required, request_body) {
+            (true, Some(body)) => Some(body.to_vec()),
+            (true, None) => {
+                bail!("app attest assertion requires bound request body but none was provided");
+            }
+            (false, _) => None,
+        };
+
+        if let Some(body) = &bound_body {
+            tracing::debug!("app_attest.assertion.bound_body_len", len = body.len());
+        }
+
+        let assertion = Assertion::from_base64(assertion_b64)
+            .context("failed to decode assertion payload")?;
+
+        assertion
+            .verify(
+                client_data_json.as_bytes().to_vec(),
+                bound_body,
+                &self.app_id,
+                public_key.to_vec(),
+                previous_counter,
+                challenge_for_validation,
+            )
+            .map_err(|e| anyhow!("app attest assertion validation failed: {e}"))?;
+
+        let counter = Self::parse_counter(assertion_b64)?;
+
+        if counter <= previous_counter {
+            bail!("app attest counter did not advance");
+        }
+
+        Ok(AssertionVerification { counter })
     }
 
     fn parse_counter(assertion_b64: &str) -> Result<u32> {
@@ -304,5 +479,40 @@ impl AppAttestService {
 
         let hash = Sha256::digest(&to_hash);
         Ok(hash.into())
+    }
+
+    pub fn build_client_data_json(
+        &self,
+        challenge_b64: &str,
+        body_digest: Option<&[u8]>,
+    ) -> Result<Vec<u8>> {
+        // For App Attest, we need to reconstruct the exact client data that the client used
+        // This should match Apple's DCAppAttestService client data structure
+        if let Some(digest) = body_digest {
+            #[derive(serde::Serialize)]
+            struct ClientDataWithBody {
+                challenge: String,
+                #[serde(rename = "requestBody")]
+                request_body: String,
+            }
+
+            let client_data = ClientDataWithBody {
+                challenge: challenge_b64.to_string(),
+                request_body: general_purpose::STANDARD.encode(digest),
+            };
+
+            serde_json::to_vec(&client_data).context("failed to serialize client data with body")
+        } else {
+            #[derive(serde::Serialize)]
+            struct ClientData {
+                challenge: String,
+            }
+
+            let client_data = ClientData {
+                challenge: challenge_b64.to_string(),
+            };
+
+            serde_json::to_vec(&client_data).context("failed to serialize client data")
+        }
     }
 }

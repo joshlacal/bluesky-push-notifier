@@ -46,7 +46,17 @@
       "Read(//etc/systemd/system/**)",
       "Bash(git add:*)",
       "Bash(git commit:*)",
-      "Bash(git push:*)"
+      "Bash(git push:*)",
+      "Bash(sudo find /etc/systemd/system -name \"*bluesky*\" -o -name \"*push-notifier*\")",
+      "Bash(sudo rm:*)",
+      "Bash(netstat:*)",
+      "Bash(dig:*)",
+      "WebFetch(domain:www.apple.com)",
+      "WebFetch(domain:blog.restlesslabs.com)",
+      "WebFetch(domain:dev.to)",
+      "Bash(journalctl:*)",
+      "WebFetch(domain:forums.developer.apple.com)",
+      "Bash(find:*)"
     ],
     "deny": [],
     "ask": []
