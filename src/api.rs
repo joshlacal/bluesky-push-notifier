@@ -25,7 +25,9 @@ use tracing::{error, info, warn};
 use crate::activity_subscription_manager::ActivitySubscriptionManager;
 use crate::app_attest::AppAttestService;
 use crate::models::{ActivitySubscription, NotificationPreference, UserDevice};
+use crate::moderation_list_manager::ModerationListManager;
 use crate::relationship_manager::RelationshipManager;
+use crate::thread_mute_manager::ThreadMuteManager;
 
 #[derive(Deserialize)]
 struct RegisterRequest {
@@ -86,6 +88,45 @@ struct ChallengeRequest {
     did: Option<String>,
     device_token: Option<String>,
     force_key_rotation: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct SyncModerationListsRequest {
+    did: String,
+    device_token: String,
+    lists: Vec<ModerationListDto>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct ModerationListDto {
+    uri: String,
+    purpose: String,
+    name: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct MuteThreadRequest {
+    did: String,
+    device_token: String,
+    thread_root_uri: String,
+}
+
+#[derive(Deserialize)]
+struct UnmuteThreadRequest {
+    did: String,
+    device_token: String,
+    thread_root_uri: String,
+}
+
+#[derive(Deserialize)]
+struct GetMutedThreadsRequest {
+    did: String,
+    device_token: String,
+}
+
+#[derive(Serialize)]
+struct MutedThreadsResponse {
+    threads: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -620,6 +661,8 @@ struct ActivitySubscriptionDeleteRequest {
 pub struct ApiState {
     pub db_pool: Pool<Postgres>,
     pub relationship_manager: Arc<RelationshipManager>,
+    pub moderation_list_manager: Arc<ModerationListManager>,
+    pub thread_mute_manager: Arc<ThreadMuteManager>,
     pub app_attest: Arc<AppAttestService>,
     pub activity_subscription_manager: Arc<ActivitySubscriptionManager>,
 }
@@ -660,6 +703,10 @@ pub fn create_api_router(state: Arc<ApiState>) -> Router {
         .route("/health", get(health_check))
         .route("/metrics", get(metrics_endpoint))
         .route("/relationships", put(update_relationships))
+        .route("/sync-moderation-lists", post(sync_moderation_lists))
+        .route("/mute-thread", post(mute_thread))
+        .route("/unmute-thread", post(unmute_thread))
+        .route("/muted-threads", get(get_muted_threads).post(get_muted_threads_post))
         .route(
             "/challenge",
             get(issue_challenge_get).post(issue_challenge_post),
@@ -2491,3 +2538,251 @@ async fn metrics_endpoint() -> impl IntoResponse {
         crate::metrics::metrics_handler(),
     )
 }
+
+// Sync moderation lists
+async fn sync_moderation_lists(
+    State(state): State<Arc<ApiState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    let proof = match AppAttestRequestProof::from_headers(&headers) {
+        Ok(proof) => proof,
+        Err(resp) => return resp,
+    };
+
+    if let Err(resp) = verify_body_binding(&body, proof.body_sha256.as_deref()) {
+        return resp;
+    }
+
+    let req: SyncModerationListsRequest = match parse_json_body(&body) {
+        Ok(req) => req,
+        Err(resp) => return resp,
+    };
+
+    // Verify App Attest assertion
+    if let Err(resp) = verify_app_attest_assertion(
+        &state,
+        &req.did,
+        &req.device_token,
+        &proof,
+        &body,
+    )
+    .await
+    {
+        return resp;
+    }
+
+    // Convert DTOs to manager types
+    let lists: Vec<crate::moderation_list_manager::ModerationList> = req
+        .lists
+        .into_iter()
+        .map(|l| crate::moderation_list_manager::ModerationList {
+            uri: l.uri,
+            purpose: l.purpose,
+            name: l.name,
+        })
+        .collect();
+
+    // TODO: Get PDS URL and access token from user's session or config
+    // For now, we'll use a placeholder - this needs to be implemented properly
+    let pds_url = std::env::var("DEFAULT_PDS_URL").unwrap_or_else(|_| "https://bsky.social".to_string());
+    let access_token = ""; // This should come from the user's session
+
+    // Sync the lists
+    let client = reqwest::Client::new();
+    match state
+        .moderation_list_manager
+        .sync_moderation_lists(&req.did, lists, &client, &pds_url, access_token)
+        .await
+    {
+        Ok(_) => {
+            info!("Successfully synced moderation lists for user {}", req.did);
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"status": "success"})),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            error!("Failed to sync moderation lists: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "Failed to sync lists"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+// Mute thread
+async fn mute_thread(
+    State(state): State<Arc<ApiState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    let proof = match AppAttestRequestProof::from_headers(&headers) {
+        Ok(proof) => proof,
+        Err(resp) => return resp,
+    };
+
+    if let Err(resp) = verify_body_binding(&body, proof.body_sha256.as_deref()) {
+        return resp;
+    }
+
+    let req: MuteThreadRequest = match parse_json_body(&body) {
+        Ok(req) => req,
+        Err(resp) => return resp,
+    };
+
+    // Verify App Attest assertion
+    if let Err(resp) = verify_app_attest_assertion(
+        &state,
+        &req.did,
+        &req.device_token,
+        &proof,
+        &body,
+    )
+    .await
+    {
+        return resp;
+    }
+
+    match state
+        .thread_mute_manager
+        .mute_thread(&req.did, &req.thread_root_uri)
+        .await
+    {
+        Ok(_) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"status": "success"})),
+        )
+            .into_response(),
+        Err(e) => {
+            error!("Failed to mute thread: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "Failed to mute thread"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+// Unmute thread
+async fn unmute_thread(
+    State(state): State<Arc<ApiState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    let proof = match AppAttestRequestProof::from_headers(&headers) {
+        Ok(proof) => proof,
+        Err(resp) => return resp,
+    };
+
+    if let Err(resp) = verify_body_binding(&body, proof.body_sha256.as_deref()) {
+        return resp;
+    }
+
+    let req: UnmuteThreadRequest = match parse_json_body(&body) {
+        Ok(req) => req,
+        Err(resp) => return resp,
+    };
+
+    // Verify App Attest assertion
+    if let Err(resp) = verify_app_attest_assertion(
+        &state,
+        &req.did,
+        &req.device_token,
+        &proof,
+        &body,
+    )
+    .await
+    {
+        return resp;
+    }
+
+    match state
+        .thread_mute_manager
+        .unmute_thread(&req.did, &req.thread_root_uri)
+        .await
+    {
+        Ok(_) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"status": "success"})),
+        )
+            .into_response(),
+        Err(e) => {
+            error!("Failed to unmute thread: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "Failed to unmute thread"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+// Get muted threads (GET)
+async fn get_muted_threads(
+    State(state): State<Arc<ApiState>>,
+    Query(req): Query<GetMutedThreadsRequest>,
+) -> impl IntoResponse {
+    match state.thread_mute_manager.get_muted_threads(&req.did).await {
+        Ok(threads) => (StatusCode::OK, Json(MutedThreadsResponse { threads })).into_response(),
+        Err(e) => {
+            error!("Failed to get muted threads: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "Failed to get muted threads"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+// Get muted threads (POST)
+async fn get_muted_threads_post(
+    State(state): State<Arc<ApiState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    let proof = match AppAttestRequestProof::from_headers(&headers) {
+        Ok(proof) => proof,
+        Err(resp) => return resp,
+    };
+
+    if let Err(resp) = verify_body_binding(&body, proof.body_sha256.as_deref()) {
+        return resp;
+    }
+
+    let req: GetMutedThreadsRequest = match parse_json_body(&body) {
+        Ok(req) => req,
+        Err(resp) => return resp,
+    };
+
+    // Verify App Attest assertion
+    if let Err(resp) = verify_app_attest_assertion(
+        &state,
+        &req.did,
+        &req.device_token,
+        &proof,
+        &body,
+    )
+    .await
+    {
+        return resp;
+    }
+
+    match state.thread_mute_manager.get_muted_threads(&req.did).await {
+        Ok(threads) => (StatusCode::OK, Json(MutedThreadsResponse { threads })).into_response(),
+        Err(e) => {
+            error!("Failed to get muted threads: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "Failed to get muted threads"})),
+            )
+                .into_response()
+        }
+    }
+}
+

@@ -21,6 +21,8 @@ pub async fn run_event_filter(
     post_resolver: Arc<crate::post_resolver::PostResolver>,
     relationship_manager: Arc<crate::relationship_manager::RelationshipManager>,
     activity_subscription_manager: Arc<ActivitySubscriptionManager>,
+    moderation_list_manager: Arc<crate::moderation_list_manager::ModerationListManager>,
+    thread_mute_manager: Arc<crate::thread_mute_manager::ThreadMuteManager>,
 ) -> Result<()> {
     info!("Starting event filter");
 
@@ -196,6 +198,39 @@ pub async fn run_event_filter(
                         "Skipping notification - author is blocked by recipient"
                     );
                     continue;
+                }
+
+                // Check moderation lists
+                if moderation_list_manager.is_in_block_list(did, &event.author).await {
+                    debug!(
+                        recipient = %did,
+                        author = %event.author,
+                        "Skipping notification - author is in recipient's block list"
+                    );
+                    continue;
+                }
+
+                if moderation_list_manager.is_in_mute_list(did, &event.author).await {
+                    debug!(
+                        recipient = %did,
+                        author = %event.author,
+                        "Skipping notification - author is in recipient's mute list"
+                    );
+                    continue;
+                }
+
+                // Check thread mutes (if this is a reply)
+                if let Some(reply) = event.record.get("reply") {
+                    if let Some(root) = reply.get("root").and_then(|r| r.get("uri")).and_then(|u| u.as_str()) {
+                        if thread_mute_manager.is_thread_muted(did, root).await {
+                            debug!(
+                                recipient = %did,
+                                thread_root = %root,
+                                "Skipping notification - thread is muted by recipient"
+                            );
+                            continue;
+                        }
+                    }
                 }
 
                 if let Some(devices) = devices_map.get(did) {

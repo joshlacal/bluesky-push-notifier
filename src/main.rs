@@ -10,16 +10,20 @@ mod filter;
 mod firehose;
 mod logging;
 mod metrics;
+mod moderation_list_manager;
 mod models;
 mod post_resolver;
 mod relationship_manager;
 mod stream;
 mod subscription;
+mod thread_mute_manager;
 
 use activity_subscription_manager::ActivitySubscriptionManager;
 use anyhow::Result;
 use app_attest::AppAttestService;
+use moderation_list_manager::ModerationListManager;
 use relationship_manager::RelationshipManager;
+use thread_mute_manager::ThreadMuteManager;
 use std::sync::Arc;
 use tokio::{
     signal,
@@ -60,6 +64,10 @@ fn main() -> Result<()> {
 
         // Initialize relationship manager with moka cache
         let relationship_manager = Arc::new(RelationshipManager::new(db_pool.clone()));
+
+        // Initialize moderation list and thread mute managers
+        let moderation_list_manager = Arc::new(ModerationListManager::new(db_pool.clone()));
+        let thread_mute_manager = Arc::new(ThreadMuteManager::new(db_pool.clone()));
 
         let activity_subscription_manager =
             Arc::new(ActivitySubscriptionManager::new(db_pool.clone()));
@@ -175,6 +183,8 @@ fn main() -> Result<()> {
             post_resolver.clone(),
             relationship_manager.clone(), // Add relationship manager
             activity_subscription_manager.clone(),
+            moderation_list_manager.clone(),
+            thread_mute_manager.clone(),
         ));
 
         // Spawn notification sender task
@@ -189,6 +199,8 @@ fn main() -> Result<()> {
         let api_state = Arc::new(api::ApiState {
             db_pool: db_pool_clone,
             relationship_manager: relationship_manager.clone(), // Add relationship manager
+            moderation_list_manager: moderation_list_manager.clone(),
+            thread_mute_manager: thread_mute_manager.clone(),
             app_attest: app_attest_service,
             activity_subscription_manager: activity_subscription_manager.clone(),
         });
