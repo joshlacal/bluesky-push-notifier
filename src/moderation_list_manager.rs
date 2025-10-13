@@ -134,11 +134,12 @@ impl ModerationListManager {
         &self,
         user_did: &str,
         lists: Vec<ModerationList>,
-        at_proto_client: &reqwest::Client,
-        pds_url: &str,
-        access_token: &str,
     ) -> Result<()> {
         info!("Syncing {} moderation lists for user {}", lists.len(), user_did);
+
+        // Use public API - no auth required for reading lists
+        let client = reqwest::Client::new();
+        let public_api = "https://public.api.bsky.app";
 
         // Start transaction
         let mut tx = self.db_pool.begin().await?;
@@ -168,9 +169,9 @@ impl ModerationListManager {
             .execute(&mut *tx)
             .await?;
 
-            // Fetch list members from AT Protocol
+            // Fetch list members from public AT Protocol API
             match self
-                .fetch_list_members(&list.uri, at_proto_client, pds_url, access_token)
+                .fetch_list_members(&list.uri, &client, public_api)
                 .await
             {
                 Ok(members) => {
@@ -214,55 +215,76 @@ impl ModerationListManager {
         Ok(())
     }
 
-    /// Fetch members of a moderation list from AT Protocol
+    /// Fetch members of a moderation list from AT Protocol public API
     async fn fetch_list_members(
         &self,
         list_uri: &str,
         client: &reqwest::Client,
-        pds_url: &str,
-        access_token: &str,
+        api_url: &str,
     ) -> Result<Vec<ListMember>> {
-        let url = format!("{}/xrpc/app.bsky.graph.getList", pds_url);
+        let url = format!("{}/xrpc/app.bsky.graph.getList", api_url);
         
-        let response = client
-            .get(&url)
-            .query(&[("list", list_uri), ("limit", "100")])
-            .header("Authorization", format!("Bearer {}", access_token))
-            .send()
-            .await
-            .context("Failed to fetch list members")?;
+        // Fetch all pages of the list
+        let mut all_members = Vec::new();
+        let mut cursor: Option<String> = None;
+        
+        loop {
+            let mut query_params = vec![("list", list_uri.to_string()), ("limit", "100".to_string())];
+            if let Some(c) = &cursor {
+                query_params.push(("cursor", c.clone()));
+            }
+            
+            let response = client
+                .get(&url)
+                .query(&query_params)
+                .send()
+                .await
+                .context("Failed to fetch list members")?;
 
-        if !response.status().is_success() {
-            anyhow::bail!("Failed to fetch list: HTTP {}", response.status());
+            if !response.status().is_success() {
+                anyhow::bail!("Failed to fetch list: HTTP {}", response.status());
+            }
+
+            #[derive(Deserialize)]
+            struct ListResponse {
+                cursor: Option<String>,
+                items: Vec<ListItem>,
+            }
+
+            #[derive(Deserialize)]
+            struct ListItem {
+                subject: SubjectDid,
+            }
+
+            #[derive(Deserialize)]
+            struct SubjectDid {
+                did: String,
+            }
+
+            let list_response: ListResponse = response
+                .json()
+                .await
+                .context("Failed to parse list response")?;
+
+            // Add members from this page
+            all_members.extend(
+                list_response
+                    .items
+                    .into_iter()
+                    .map(|item| ListMember {
+                        subject: item.subject.did,
+                    })
+            );
+            
+            // Check if there are more pages
+            if let Some(next_cursor) = list_response.cursor {
+                cursor = Some(next_cursor);
+            } else {
+                break;
+            }
         }
 
-        #[derive(Deserialize)]
-        struct ListResponse {
-            items: Vec<ListItem>,
-        }
-
-        #[derive(Deserialize)]
-        struct ListItem {
-            subject: SubjectDid,
-        }
-
-        #[derive(Deserialize)]
-        struct SubjectDid {
-            did: String,
-        }
-
-        let list_response: ListResponse = response
-            .json()
-            .await
-            .context("Failed to parse list response")?;
-
-        Ok(list_response
-            .items
-            .into_iter()
-            .map(|item| ListMember {
-                subject: item.subject.did,
-            })
-            .collect())
+        Ok(all_members)
     }
 
     /// Invalidate caches for a user (call after sync)

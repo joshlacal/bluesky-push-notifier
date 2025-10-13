@@ -2583,16 +2583,10 @@ async fn sync_moderation_lists(
         })
         .collect();
 
-    // TODO: Get PDS URL and access token from user's session or config
-    // For now, we'll use a placeholder - this needs to be implemented properly
-    let pds_url = std::env::var("DEFAULT_PDS_URL").unwrap_or_else(|_| "https://bsky.social".to_string());
-    let access_token = ""; // This should come from the user's session
-
-    // Sync the lists
-    let client = reqwest::Client::new();
+    // Sync the lists - server fetches members from public API
     match state
         .moderation_list_manager
-        .sync_moderation_lists(&req.did, lists, &client, &pds_url, access_token)
+        .sync_moderation_lists(&req.did, lists)
         .await
     {
         Ok(_) => {
