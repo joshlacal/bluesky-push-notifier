@@ -64,26 +64,55 @@ The application requires these environment variables:
 - Uses `tracing` for structured logging with configurable levels
 - Includes Prometheus metrics collection in `metrics.rs`
 
-## Current Deployment Status
+## Deployment
 
-### Running Services
-You currently have **2** healthy `bluesky-push-notifier` services running:
+### Systemd Services
+The application is deployed using systemd services for automatic restart and service management:
 
 #### Service 1 - Staging (STG)
-- **PID**: 38023 (main process), 38010 (doppler wrapper)
+- **Service**: `bluesky-push-notifier-stg.service`
 - **Port**: 8080
 - **Config**: `stg` (Doppler)
-- **Health**: ✅ Healthy
 - **Command**: `doppler run --config stg -- /home/ubuntu/bluesky-push-notifier/target/release/bluesky-push-notifier`
 - **Domain**: notifications.catbird.blue (production domain)
+- **Management**:
+  - Start: `sudo systemctl start bluesky-push-notifier-stg`
+  - Stop: `sudo systemctl stop bluesky-push-notifier-stg`
+  - Restart: `sudo systemctl restart bluesky-push-notifier-stg`
+  - Status: `sudo systemctl status bluesky-push-notifier-stg`
+  - Logs: `sudo journalctl -u bluesky-push-notifier-stg -f`
 
 #### Service 2 - Development (DEV)
-- **PID**: 45136 (main process), 45109 (doppler wrapper)  
+- **Service**: `bluesky-push-notifier-dev.service`
 - **Port**: 8081
 - **Config**: `dev` (Doppler)
-- **Health**: ✅ Healthy
 - **Command**: `doppler run --config dev -- /home/ubuntu/bluesky-push-notifier/target/release/bluesky-push-notifier`
 - **Domain**: dev.notifications.catbird.blue
+- **Management**:
+  - Start: `sudo systemctl start bluesky-push-notifier-dev`
+  - Stop: `sudo systemctl stop bluesky-push-notifier-dev`
+  - Restart: `sudo systemctl restart bluesky-push-notifier-dev`
+  - Status: `sudo systemctl status bluesky-push-notifier-dev`
+  - Logs: `sudo journalctl -u bluesky-push-notifier-dev -f`
+
+### Deployment Process
+After building a new version, deploy by restarting the systemd services:
+```bash
+# Build the release binary
+cargo build --release
+
+# Restart DEV service first for testing
+sudo systemctl restart bluesky-push-notifier-dev
+
+# Check logs and verify it's working
+sudo journalctl -u bluesky-push-notifier-dev -f
+
+# If DEV looks good, restart STG
+sudo systemctl restart bluesky-push-notifier-stg
+
+# Verify STG
+sudo journalctl -u bluesky-push-notifier-stg -f
+```
 
 ### Nginx Configurations
 

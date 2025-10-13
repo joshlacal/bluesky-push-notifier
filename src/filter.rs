@@ -25,7 +25,14 @@ pub async fn run_event_filter(
     info!("Starting event filter");
 
     // Cache of registered users to avoid frequent DB lookups
-    let mut registered_users_vec = db::get_registered_users(&db_pool).await?;
+    // IMPORTANT: Handle initial load failure gracefully - don't crash the entire task
+    let mut registered_users_vec = match db::get_registered_users(&db_pool).await {
+        Ok(users) => users,
+        Err(e) => {
+            error!("Failed to load initial registered users, starting with empty cache: {}", e);
+            Vec::new()
+        }
+    };
     let mut registered_users: HashSet<String> = registered_users_vec.iter().cloned().collect();
     let mut last_cache_refresh = std::time::Instant::now();
 

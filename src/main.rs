@@ -160,14 +160,14 @@ fn main() -> Result<()> {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
         // Spawn firehose consumer task
-        let firehose_handle = tokio::spawn(firehose::run_firehose_consumer(
+        let mut firehose_handle = tokio::spawn(firehose::run_firehose_consumer(
             config.bsky_service_url.clone(),
             event_sender,
             db_pool.clone(),
             shutdown_rx,
         ));
 
-        let filter_handle = tokio::spawn(filter::run_event_filter(
+        let mut filter_handle = tokio::spawn(filter::run_event_filter(
             event_receiver,
             notification_sender,
             db_pool.clone(),
@@ -178,7 +178,7 @@ fn main() -> Result<()> {
         ));
 
         // Spawn notification sender task
-        let apns_handle = tokio::spawn(apns::run_notification_sender(
+        let mut apns_handle = tokio::spawn(apns::run_notification_sender(
             notification_receiver,
             apns_client,
             db_pool.clone(),
@@ -200,14 +200,47 @@ fn main() -> Result<()> {
 
             info!("Starting API server on {}", addr);
 
-            let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-            axum::serve(listener, api_router).await.unwrap();
+            let listener = match tokio::net::TcpListener::bind(&addr).await {
+                Ok(listener) => listener,
+                Err(e) => {
+                    error!("Failed to bind API server to {}: {}", addr, e);
+                    return;
+                }
+            };
+
+            if let Err(e) = axum::serve(listener, api_router).await {
+                error!("API server error: {}", e);
+            }
         });
 
-        // Handle graceful shutdown
+        // Handle graceful shutdown and monitor for task failures
         tokio::select! {
             _ = signal::ctrl_c() => {
                 info!("Received shutdown signal, shutting down gracefully");
+            }
+            result = &mut firehose_handle => {
+                match result {
+                    Ok(Ok(())) => info!("Firehose task exited cleanly"),
+                    Ok(Err(e)) => error!("Firehose task failed: {}", e),
+                    Err(e) => error!("Firehose task panicked: {}", e),
+                }
+                error!("Critical: Firehose task stopped unexpectedly, initiating shutdown");
+            }
+            result = &mut filter_handle => {
+                match result {
+                    Ok(Ok(())) => info!("Filter task exited cleanly"),
+                    Ok(Err(e)) => error!("Filter task failed: {}", e),
+                    Err(e) => error!("Filter task panicked: {}", e),
+                }
+                error!("Critical: Filter task stopped unexpectedly, initiating shutdown");
+            }
+            result = &mut apns_handle => {
+                match result {
+                    Ok(Ok(())) => info!("APNS task exited cleanly"),
+                    Ok(Err(e)) => error!("APNS task failed: {}", e),
+                    Err(e) => error!("APNS task panicked: {}", e),
+                }
+                error!("Critical: APNS task stopped unexpectedly, initiating shutdown");
             }
         }
 

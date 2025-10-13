@@ -56,7 +56,11 @@
       "WebFetch(domain:dev.to)",
       "Bash(journalctl:*)",
       "WebFetch(domain:forums.developer.apple.com)",
-      "Bash(find:*)"
+      "Bash(find:*)",
+      "Bash(pstree:*)",
+      "Bash(sudo find /etc/systemd/system -name \"*bluesky*\" -o -name \"*push-notifier*\" -o -name \"*catbird*\")",
+      "Bash(systemctl list-units:*)",
+      "Bash(systemctl is-active:*)"
     ],
     "deny": [],
     "ask": []

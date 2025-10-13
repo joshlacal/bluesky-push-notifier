@@ -89,12 +89,12 @@ impl Assertion {
         // CRITICAL FIX: Handle JSON client data like we do in attestation.rs
         // The client now sends JSON client data, so we need to parse it correctly
         let client_data_str = String::from_utf8(client_data_byte.clone())?;
-        tracing::trace!("assertion.client_data", %client_data_str);
+        tracing::trace!("assertion.client_data: {}", client_data_str);
 
         let client_data = serde_json::from_slice::<ClientData>(&client_data_byte)?;
 
         if let Some(body) = &bound_request_body {
-            tracing::trace!("assertion.bound_body_len", len = body.len());
+            tracing::trace!("assertion.bound_body_len: {}", body.len());
         }
 
         let auth_data = AuthenticatorData::new(self.raw_authenticator_data)?;
@@ -110,9 +110,9 @@ impl Assertion {
         hasher.update(&digest_input);
         let client_data_hash = hasher.finalize();
         tracing::trace!(
-            "assertion.digest",
-            input_len = digest_input.len(),
-            client_data_hash_b64 = general_purpose::STANDARD.encode(client_data_hash.as_slice())
+            "assertion.digest: input_len={}, client_data_hash_b64={}",
+            digest_input.len(),
+            general_purpose::STANDARD.encode(client_data_hash.as_slice())
         );
 
         let verifying_key = VerifyingKey::from_sec1_bytes(&public_key_byte)
@@ -129,10 +129,10 @@ impl Assertion {
 
         // 3. Use the public key that you store from the attestation object to verify that the assertion's signature is valid for nonce.
         tracing::trace!(
-            "assertion.signature",
-            public_key_len = public_key_byte.len(),
-            signature_len = self.signature.len(),
-            nonce_hash_b64 = general_purpose::STANDARD.encode(nonce_hash.as_slice())
+            "assertion.signature: public_key_len={}, signature_len={}, nonce_hash_b64={}",
+            public_key_byte.len(),
+            self.signature.len(),
+            general_purpose::STANDARD.encode(nonce_hash.as_slice())
         );
 
         if verifying_key.verify(nonce_hash.as_slice(), &signature).is_err() {

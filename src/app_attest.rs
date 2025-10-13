@@ -277,7 +277,7 @@ impl AppAttestService {
             .context("invalid attestation base64")?;
 
         // Parse CBOR attestation structure
-        let attestation_obj: serde_json::Value =
+        let _attestation_obj: serde_json::Value =
             from_reader(bytes.as_slice()).context("failed to decode attestation CBOR")?;
 
         // Try to extract public key from authenticator data
@@ -393,10 +393,18 @@ impl AppAttestService {
         stored_challenge: Option<&str>,
         presented_challenge: &str,
     ) -> Result<AssertionVerification> {
-        tracing::debug!("app_attest.assertion.client_data", %client_data_json);
-        tracing::debug!("app_attest.assertion.presented_challenge", %presented_challenge);
+        tracing::debug!("🔍 ASSERTION: Received client_data_json: {}", client_data_json);
+        tracing::debug!("🔍 ASSERTION: presented_challenge: {}", presented_challenge);
+        if let Some(stored) = stored_challenge {
+            tracing::debug!("🔍 ASSERTION: stored_challenge: {}", stored);
+        }
 
-        let challenge_for_validation = stored_challenge.unwrap_or(presented_challenge);
+        // CRITICAL: Use the presented challenge (from the request) for validation
+        // The stored challenge is just for preventing replay attacks
+        // The client sends client data with the presented challenge, so we must validate against that
+        let challenge_for_validation = presented_challenge;
+        
+        tracing::debug!("🔍 ASSERTION: Using challenge for validation: {}", challenge_for_validation);
 
         let bound_body = match (body_binding_required, request_body) {
             (true, Some(body)) => Some(body.to_vec()),
@@ -407,11 +415,44 @@ impl AppAttestService {
         };
 
         if let Some(body) = &bound_body {
-            tracing::debug!("app_attest.assertion.bound_body_len", len = body.len());
+            tracing::debug!("🔍 ASSERTION: bound_body_len: {}", body.len());
         }
 
         let assertion = Assertion::from_base64(assertion_b64)
             .context("failed to decode assertion payload")?;
+
+        // Parse counter BEFORE verification to log it
+        let assertion_counter = Self::parse_counter(assertion_b64)?;
+        tracing::debug!(
+            "🔍 ASSERTION: Parsed counter from assertion: {} (previous was: {})",
+            assertion_counter,
+            previous_counter
+        );
+
+        // The client data JSON should contain the challenge that matches what we're validating against
+        // Verify the client data actually contains the expected challenge
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(client_data_json) {
+            if let Some(challenge_in_client_data) = parsed.get("challenge").and_then(|v| v.as_str()) {
+                tracing::debug!("🔍 ASSERTION: challenge_in_client_data: {}", challenge_in_client_data);
+                if challenge_in_client_data != challenge_for_validation {
+                    tracing::error!(
+                        "❌ ASSERTION: Challenge mismatch! client_data has '{}' but validating against '{}'",
+                        challenge_in_client_data,
+                        challenge_for_validation
+                    );
+                    bail!("challenge in client data does not match expected challenge");
+                }
+            } else {
+                tracing::warn!("⚠️ ASSERTION: No challenge found in client_data_json");
+            }
+        }
+
+        tracing::debug!(
+            "🔍 ASSERTION: About to verify with app_id={}, public_key_len={}, previous_counter={}",
+            &self.app_id,
+            public_key.len(),
+            previous_counter
+        );
 
         assertion
             .verify(
@@ -422,14 +463,25 @@ impl AppAttestService {
                 previous_counter,
                 challenge_for_validation,
             )
-            .map_err(|e| anyhow!("app attest assertion validation failed: {e}"))?;
+            .map_err(|e| {
+                tracing::error!("❌ ASSERTION: Verification failed: {}", e);
+                tracing::error!("❌ ASSERTION: Details - counter={}, previous_counter={}, app_id={}", 
+                    assertion_counter, previous_counter, &self.app_id);
+                anyhow!("app attest assertion validation failed: {e}")
+            })?;
 
-        let counter = Self::parse_counter(assertion_b64)?;
+        let counter = assertion_counter; // Use the counter we already parsed
 
         if counter <= previous_counter {
+            tracing::error!(
+                "❌ ASSERTION: Counter did not advance: {} <= {}",
+                counter,
+                previous_counter
+            );
             bail!("app attest counter did not advance");
         }
 
+        tracing::info!("✅ ASSERTION: Verification succeeded with counter {}", counter);
         Ok(AssertionVerification { counter })
     }
 

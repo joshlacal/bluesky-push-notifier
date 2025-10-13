@@ -26,13 +26,20 @@ struct RepoSubscription {
 }
 
 impl RepoSubscription {
-    async fn new(bgs: &str, _cursor: Option<String>) -> Result<Self> {
+    async fn new(bgs: &str, cursor: Option<String>) -> Result<Self> {
         // Strip protocol prefix if present
         let host = bgs
             .strip_prefix("https://")
             .or_else(|| bgs.strip_prefix("http://"))
             .unwrap_or(bgs);
-        let ws_url = format!("wss://{}/xrpc/{}", host, NSID);
+        
+        // Build WebSocket URL with optional cursor parameter
+        let ws_url = if let Some(cursor_val) = cursor {
+            format!("wss://{}/xrpc/{}?cursor={}", host, NSID, cursor_val)
+        } else {
+            format!("wss://{}/xrpc/{}", host, NSID)
+        };
+        
         info!("Connecting to firehose at: {}", ws_url);
 
         let (stream, _) = connect_async(ws_url).await?;
@@ -195,35 +202,23 @@ pub async fn run_firehose_consumer(
     db_pool: Pool<Postgres>,
     mut shutdown: oneshot::Receiver<()>,
 ) -> Result<()> {
-    error!(
-        "DEBUG: run_firehose_consumer function called with URL: {}",
-        bsky_service_url
-    );
-    error!("DEBUG: About to call info! log");
     info!("Starting firehose consumer");
-    error!("DEBUG: After info! log");
 
-    // Maximum reconnection attempts
+    // Maximum reconnection attempts in a row before giving up
     const MAX_RECONNECTS: u32 = 10;
     // Base delay between reconnection attempts (will be exponentially increased)
     let mut reconnect_delay = 1;
     let mut reconnect_attempts = 0;
 
     'outer: loop {
-        error!("DEBUG: Starting outer loop iteration");
         // Get last cursor from database for resuming
-        error!("DEBUG: About to call get_last_cursor");
         let last_cursor = match db::get_last_cursor(&db_pool).await {
-            Ok(cursor) => {
-                error!("DEBUG: get_last_cursor succeeded: {:?}", cursor);
-                cursor
-            }
+            Ok(cursor) => cursor,
             Err(e) => {
                 error!("Failed to get last cursor: {}", e);
                 None
             }
         };
-        error!("DEBUG: After get_last_cursor");
 
         info!(
             "Connecting to firehose, starting from cursor: {:?}",
@@ -231,13 +226,8 @@ pub async fn run_firehose_consumer(
         );
 
         // Create subscription with retry logic
-        error!(
-            "DEBUG: About to call RepoSubscription::new with URL: {}",
-            bsky_service_url
-        );
         let subscription_result =
             RepoSubscription::new(&bsky_service_url, last_cursor.clone()).await;
-        error!("DEBUG: RepoSubscription::new completed");
 
         let mut subscription = match subscription_result {
             Ok(sub) => sub,
@@ -278,51 +268,72 @@ pub async fn run_firehose_consumer(
             db_pool: db_pool.clone(),
         };
 
+        // Add heartbeat timeout to detect stuck connections
+        const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(60); // No data for 60s = reconnect
+        let mut last_activity = tokio::time::Instant::now();
+
         // Process incoming frames
         'inner: loop {
             tokio::select! {
-                Some(frame_result) = subscription.next() => {
-                    match frame_result {
-                        Ok(Frame::Message(Some(t), message)) => {
-                            if t.as_str() == "#commit" {
-                                // Parse commit from message
-                                match serde_ipld_dagcbor::from_reader::<Commit, _>(&message.body[..]) {
-                                    Ok(commit) => {
-                                        // Only log occasional commits for processing stats
-                                        if commit.seq % 5000 == 0 {
-                                            info!("Processing commit at sequence: {}", commit.seq);
-                                        }
+                frame_option = subscription.next() => {
+                    // Update activity timestamp
+                    last_activity = tokio::time::Instant::now();
+                    
+                    match frame_option {
+                        Some(frame_result) => {
+                            match frame_result {
+                                Ok(Frame::Message(Some(t), message)) => {
+                                    if t.as_str() == "#commit" {
+                                        // Parse commit from message
+                                        match serde_ipld_dagcbor::from_reader::<Commit, _>(&message.body[..]) {
+                                            Ok(commit) => {
+                                                // Only log occasional commits for processing stats
+                                                if commit.seq % 5000 == 0 {
+                                                    info!("Processing commit at sequence: {}", commit.seq);
+                                                }
 
-                                        // Handle commit without flooding logs
-                                        if let Err(e) = handler.handle_commit(&commit).await {
-                                            error!("Error handling commit: {}", e);
-                                        }
+                                                // Handle commit without flooding logs
+                                                if let Err(e) = handler.handle_commit(&commit).await {
+                                                    error!("Error handling commit: {}", e);
+                                                }
 
-                                        // Reset reconnect counter on successful processing
-                                        reconnect_attempts = 0;
-                                        reconnect_delay = 1;
-                                    },
-                                    Err(e) => {
-                                        error!("Failed to parse commit: {}", e);
+                                                // Reset reconnect counter on successful processing
+                                                reconnect_attempts = 0;
+                                                reconnect_delay = 1;
+                                            },
+                                            Err(e) => {
+                                                error!("Failed to parse commit: {}", e);
+                                            }
+                                        }
+                                    } else {
+                                        // Only log non-commit messages
+                                        debug!("Received message of type: {}", t);
                                     }
+                                },
+                                Ok(Frame::Message(None, _)) => {
+                                    // Ignore message with no type
+                                },
+                                Ok(Frame::Error(_)) => {
+                                    error!("Received error frame from firehose");
+                                    break 'inner; // Break inner loop to reconnect
+                                },
+                                Err(e) => {
+                                    error!("Error parsing frame: {}", e);
+                                    break 'inner; // Break inner loop to reconnect
                                 }
-                            } else {
-                                // Only log non-commit messages
-                                debug!("Received message of type: {}", t);
                             }
                         },
-                        Ok(Frame::Message(None, _)) => {
-                            // Ignore message with no type
-                        },
-                        Ok(Frame::Error(_)) => {
-                            error!("Received error frame from firehose");
-                            break 'inner; // Break inner loop to reconnect
-                        },
-                        Err(e) => {
-                            error!("Error parsing frame: {}", e);
+                        None => {
+                            // WebSocket stream ended - this is the critical fix!
+                            warn!("Firehose stream ended (returned None), reconnecting...");
                             break 'inner; // Break inner loop to reconnect
                         }
                     }
+                },
+                _ = tokio::time::sleep_until(last_activity + HEARTBEAT_TIMEOUT) => {
+                    // No data received for HEARTBEAT_TIMEOUT duration
+                    warn!("No data received from firehose for {} seconds, reconnecting...", HEARTBEAT_TIMEOUT.as_secs());
+                    break 'inner; // Break inner loop to reconnect
                 },
                 _ = &mut shutdown => {
                     info!("Received shutdown signal, stopping firehose consumer");

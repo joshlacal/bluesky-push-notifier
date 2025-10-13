@@ -70,3 +70,39 @@ The application requires these environment variables:
 - Debug script available at `tools/debug-firehose.sh` for WebSocket connection testing
 - Uses `tracing` for structured logging with configurable levels
 - Includes Prometheus metrics collection in `metrics.rs`
+
+## Deployment
+
+### Systemd Services
+The application is deployed using systemd services for automatic restart and service management:
+
+#### Available Services
+- **bluesky-push-notifier-stg.service** - Staging/Production service (port 8080)
+- **bluesky-push-notifier-dev.service** - Development service (port 8081)
+
+#### Service Management
+```bash
+# Restart services after building
+sudo systemctl restart bluesky-push-notifier-dev  # DEV environment
+sudo systemctl restart bluesky-push-notifier-stg  # STG environment
+
+# Check status
+sudo systemctl status bluesky-push-notifier-dev
+sudo systemctl status bluesky-push-notifier-stg
+
+# View logs (follows new log entries)
+sudo journalctl -u bluesky-push-notifier-dev -f
+sudo journalctl -u bluesky-push-notifier-stg -f
+
+# View recent logs
+sudo journalctl -u bluesky-push-notifier-dev -n 100
+sudo journalctl -u bluesky-push-notifier-stg -n 100
+```
+
+#### Service Configuration
+Both services are configured to:
+- Auto-restart on failure (RestartSec=10)
+- Start automatically on boot
+- Use Doppler for environment configuration
+- Log to systemd journal
+- Run as ubuntu user with resource limits

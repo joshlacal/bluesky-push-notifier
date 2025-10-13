@@ -10,7 +10,7 @@ fn build_default_filter() -> EnvFilter {
     for directive in [
         "bluesky_push_notifier::api=info",
         "bluesky_push_notifier::app_attest=debug",
-        "bluesky_push_notifier::firehose=warn",
+        "bluesky_push_notifier::firehose=info",
         "bluesky_push_notifier::filter=warn",
         "bluesky_push_notifier::stream=warn",
         "bluesky_push_notifier::subscription=warn",
