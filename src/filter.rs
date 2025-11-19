@@ -270,7 +270,7 @@ pub async fn run_event_filter(
                                         )
                                         .await
                                         {
-                                            Ok((title, body, uri)) => {
+                                            Ok((title, body, uri, media_urls, thumbnail_url)) => {
                                                 let mut data = HashMap::new();
                                                 data.insert("did".to_string(), did.clone());
                                                 data.insert(
@@ -294,6 +294,18 @@ pub async fn run_event_filter(
                                                     );
                                                 }
 
+                                                // Add media information to custom data if available
+                                                if let Some(ref urls) = media_urls {
+                                                    // Add media URLs as a JSON array string
+                                                    if let Ok(media_json) = serde_json::to_string(urls) {
+                                                        data.insert("mediaUrls".to_string(), media_json);
+                                                    }
+                                                }
+
+                                                if let Some(ref thumb_url) = thumbnail_url {
+                                                    data.insert("thumbnailUrl".to_string(), thumb_url.clone());
+                                                }
+
                                                 let payload = NotificationPayload {
                                                     user_did: did.clone(),
                                                     device_token: device.device_token.clone(),
@@ -301,6 +313,8 @@ pub async fn run_event_filter(
                                                     title,
                                                     body,
                                                     data,
+                                                    media_urls,
+                                                    thumbnail_url,
                                                 };
 
                                                 let remaining_capacity = notification_sender.capacity();
@@ -679,12 +693,130 @@ fn extract_target_dids(event: &BlueskyEvent, registered_users: &[String]) -> Vec
     Vec::new()
 }
 
+/// Extract media URLs from an embed object in a Bluesky post
+/// Converts blob CID references to full CDN URLs for display
+fn extract_media_from_embed(embed: &serde_json::Value, author_did: &str) -> (Option<Vec<String>>, Option<String>) {
+    let mut media_urls = Vec::new();
+    let mut thumbnail_url = None;
+
+    // Get the embed type
+    let embed_type = embed
+        .get("$type")
+        .and_then(|t| t.as_str())
+        .unwrap_or("");
+
+    match embed_type {
+        // Handle images embed
+        "app.bsky.embed.images" => {
+            if let Some(images) = embed.get("images").and_then(|i| i.as_array()) {
+                for image in images {
+                    if let Some(img_obj) = image.as_object() {
+                        // For images in the record, we have a blob reference
+                        if let Some(image_blob) = img_obj.get("image") {
+                            if let Some(ref_link) = image_blob.get("ref").and_then(|r| r.get("$link")).and_then(|l| l.as_str()) {
+                                // Convert CID to CDN URL
+                                let cdn_url = format!(
+                                    "https://cdn.bsky.app/img/feed_fullsize/plain/{}/{}@jpeg",
+                                    author_did, ref_link
+                                );
+                                media_urls.push(cdn_url);
+                            }
+                        }
+                    }
+                }
+                // Use the first image as thumbnail
+                if !media_urls.is_empty() {
+                    // For thumbnails, use the thumbnail endpoint
+                    if let Some(first_img) = embed.get("images")
+                        .and_then(|i| i.as_array())
+                        .and_then(|arr| arr.first())
+                        .and_then(|img| img.get("image"))
+                        .and_then(|blob| blob.get("ref"))
+                        .and_then(|r| r.get("$link"))
+                        .and_then(|l| l.as_str())
+                    {
+                        thumbnail_url = Some(format!(
+                            "https://cdn.bsky.app/img/feed_thumbnail/plain/{}/{}@jpeg",
+                            author_did, first_img
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Handle video embed
+        "app.bsky.embed.video" => {
+            if let Some(video_blob) = embed.get("video") {
+                if let Some(ref_link) = video_blob.get("ref").and_then(|r| r.get("$link")).and_then(|l| l.as_str()) {
+                    // For video, we'll use the blob reference as-is since video URLs are different
+                    // The client will need to handle video blob access
+                    media_urls.push(ref_link.to_string());
+                }
+            }
+            // Get thumbnail if available
+            if let Some(thumb_blob) = embed.get("thumbnail") {
+                if let Some(ref_link) = thumb_blob.get("ref").and_then(|r| r.get("$link")).and_then(|l| l.as_str()) {
+                    // Convert thumbnail CID to CDN URL
+                    thumbnail_url = Some(format!(
+                        "https://cdn.bsky.app/img/feed_thumbnail/plain/{}/{}@jpeg",
+                        author_did, ref_link
+                    ));
+                }
+            }
+        }
+
+        // Handle external link embed (website cards)
+        "app.bsky.embed.external" => {
+            if let Some(external) = embed.get("external") {
+                // Get the thumbnail image for the external link
+                if let Some(thumb_blob) = external.get("thumb") {
+                    if let Some(ref_link) = thumb_blob.get("ref").and_then(|r| r.get("$link")).and_then(|l| l.as_str()) {
+                        let cdn_url = format!(
+                            "https://cdn.bsky.app/img/feed_thumbnail/plain/{}/{}@jpeg",
+                            author_did, ref_link
+                        );
+                        thumbnail_url = Some(cdn_url.clone());
+                        media_urls.push(cdn_url);
+                    }
+                }
+            }
+        }
+
+        // Handle record with media (quote post with images/video)
+        "app.bsky.embed.recordWithMedia" => {
+            // Extract media from the media field
+            if let Some(media) = embed.get("media") {
+                let (urls, thumb) = extract_media_from_embed(media, author_did);
+                if let Some(urls) = urls {
+                    media_urls.extend(urls);
+                }
+                if thumbnail_url.is_none() {
+                    thumbnail_url = thumb;
+                }
+            }
+        }
+
+        _ => {
+            // For other types or unknown embeds, try to extract any image references
+            debug!(embed_type, "Unknown embed type encountered");
+        }
+    }
+
+    let result_urls = if media_urls.is_empty() {
+        None
+    } else {
+        Some(media_urls)
+    };
+
+    (result_urls, thumbnail_url)
+}
+
 async fn create_notification_content(
     handle_map: &HashMap<String, String>,
     notification_type: &NotificationType,
     event: &BlueskyEvent,
     post_resolver: &PostResolver,
-) -> Result<(String, String, Option<String>)> {
+) -> Result<(String, String, Option<String>, Option<Vec<String>>, Option<String>)> {
     // Use resolved handle if available, fallback to DID
     let username = handle_map.get(&event.author).cloned().unwrap_or_else(|| {
         event
@@ -930,16 +1062,25 @@ async fn create_notification_content(
         }
     };
 
+    // Extract media from the event's embed field
+    let (media_urls, thumbnail_url) = if let Some(embed) = event.record.get("embed") {
+        extract_media_from_embed(embed, &event.author)
+    } else {
+        (None, None)
+    };
+
     tracing::debug!(
         notification_type = ?notification_type,
         username = %username,
         title = %title,
         body = %body,
         uri = ?uri,
+        media_count = ?media_urls.as_ref().map(|m| m.len()),
+        has_thumbnail = thumbnail_url.is_some(),
         "Created notification content"
     );
 
-    Ok((title, body, uri))
+    Ok((title, body, uri, media_urls, thumbnail_url))
 }
 
 // Extract DIDs from via field for via notifications

@@ -79,6 +79,8 @@ impl ApnsClient {
             notification_type = ?payload_data.notification_type,
             user_did = %payload_data.user_did,
             title = %payload_data.title,
+            media_count = ?payload_data.media_urls.as_ref().map(|m| m.len()),
+            has_thumbnail = payload_data.thumbnail_url.is_some(),
             "Sending notification"
         );
 

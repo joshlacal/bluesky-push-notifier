@@ -92,6 +92,10 @@ pub struct NotificationPayload {
     pub title: String,
     pub body: String,
     pub data: HashMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media_urls: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thumbnail_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
