@@ -1,6 +1,6 @@
 [package]
 name = "bluesky-push-notifier"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [dependencies]
@@ -9,7 +9,6 @@ bsky-sdk = "0.1.21"
 atrium-api = "0.25.5"
 atrium-repo = "0.1.5"
 atrium-xrpc-client = "0.5.14"
-a2 = "0.10"
 sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "time", "uuid"] }
 serde = { version = "1.0", features = ["derive"] }
 time = { version = "0.3", features = ["serde-human-readable"] }
@@ -28,20 +27,6 @@ ipld-core = { version = "0.4.2", default-features = false, features = ["std"] }
 chrono = "0.4.40"
 trait-variant = "0.1.2"
 axum = "0.7"
-tower-http = { version = "0.5", features = ["cors", "limit"] }
-reqwest = { version = "0.12.15", features = ["json"] }
 num_cpus = "1.16"
 prometheus = "0.13"
 lazy_static = "1.4"
-circuit_breaker = "0.1.1"
-moka = { version = "0.11", features = ["future"] }
-constant_time_eq = "0.2"
-tower = { version = "0.5", features = ["limit"] }
-sha2 = "0.10.8"  # Add this dependency for SHA-256 hashing
-appattest-rs = "0.1"
-base64 = "0.22"
-rand = "0.8"
-ciborium = "0.2"
-
-[patch.crates-io]
-appattest-rs = { path = "crates/appattest-rs-0.1.0" }

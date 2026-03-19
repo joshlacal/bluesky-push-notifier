@@ -6,17 +6,12 @@ fn build_default_filter() -> EnvFilter {
 
     let mut filter = EnvFilter::new(format!("bluesky_push_notifier={base_level}"));
 
-    // Clamp noisy subsystems regardless of the global level.
     for directive in [
-        "bluesky_push_notifier::api=info",
-        "bluesky_push_notifier::app_attest=debug",
         "bluesky_push_notifier::firehose=info",
         "bluesky_push_notifier::filter=warn",
         "bluesky_push_notifier::stream=warn",
         "bluesky_push_notifier::subscription=warn",
         "sqlx=warn",
-        "tower_http=warn",
-        "a2=warn",
     ] {
         filter = filter.add_directive(directive.parse().expect("invalid log directive"));
     }
@@ -35,16 +30,14 @@ pub fn setup_logging() {
         }
     }
 
-    // Initialize the subscriber with the filter
     fmt()
         .with_env_filter(filter)
         .with_target(true)
         .with_file(true)
         .with_line_number(true)
-        // Disable unnecessary details to keep logs clean
         .with_thread_ids(false)
         .with_thread_names(false)
         .init();
 
-    tracing::info!("Logging initialized at custom levels");
+    tracing::info!("Logging initialized");
 }

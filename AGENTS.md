@@ -2,6 +2,16 @@
 
 This file provides guidance to AI agents when working with code in this repository.
 
+## Build & Test Workflow
+
+Agents SHOULD build and test autonomously:
+- Rust builds are fast with incremental compilation
+- Use `cargo build`, `cargo test`, `cargo clippy` freely
+- Verify changes work before reporting completion
+- Run parallel tasks when independent (build + lint + test)
+
+See `~/Developer/.claude/AGENTS.md` for global agent guidelines.
+
 ## Development Commands
 
 - `cargo build` - Build the project

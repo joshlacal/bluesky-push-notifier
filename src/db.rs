@@ -1,20 +1,18 @@
 use anyhow::Result;
 use sqlx::{postgres::PgPoolOptions, Pool, Postgres, Row};
-use std::collections::HashMap;
 use tracing::info;
 
-use crate::models::{ActivitySubscription, FirehoseCursor, NotificationPreference, UserDevice};
+use crate::models::FirehoseCursor;
 
 pub async fn init_db_pool(database_url: &str) -> Result<Pool<Postgres>> {
     info!("Initializing database connection pool");
 
-    // Calculate optimal connection count based on CPU cores
     let max_connections = std::env::var("DATABASE_MAX_CONNECTIONS")
         .ok()
         .and_then(|s| s.parse::<u32>().ok())
         .unwrap_or_else(|| {
             let cores = num_cpus::get() as u32;
-            cores * 2 + 1 // Common formula for connection pools
+            cores * 2 + 1
         });
 
     info!(
@@ -27,174 +25,32 @@ pub async fn init_db_pool(database_url: &str) -> Result<Pool<Postgres>> {
         .connect(database_url)
         .await?;
 
-    // Run migrations
-    sqlx::migrate!("./migrations").run(&pool).await?;
-
     Ok(pool)
 }
 
-pub async fn get_user_devices(pool: &Pool<Postgres>, did: &str) -> Result<Vec<UserDevice>> {
-    let devices = sqlx::query_as::<_, UserDevice>(
+/// Create firehose_cursor table if it doesn't exist.
+/// All other tables (user_devices, push_event_queue, activity_subscriptions)
+/// are managed by nest's migrations.
+pub async fn ensure_firehose_cursor_table(pool: &Pool<Postgres>) -> Result<()> {
+    sqlx::query(
         r#"
-        SELECT id, did, device_token, created_at, updated_at,
-               app_attest_key_id,
-               app_attest_public_key,
-               app_attest_receipt,
-               app_attest_counter,
-               app_attest_challenge,
-               app_attest_challenge_expires_at,
-               app_attest_last_verified_at
-        FROM user_devices
-        WHERE did = $1
+        CREATE TABLE IF NOT EXISTS firehose_cursor (
+            id SERIAL PRIMARY KEY,
+            cursor TEXT NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
         "#,
     )
-    .bind(did)
-    .fetch_all(pool)
+    .execute(pool)
     .await?;
-
-    Ok(devices)
+    Ok(())
 }
 
-pub async fn get_user_devices_batch(
-    pool: &Pool<Postgres>,
-    dids: &[String],
-) -> Result<HashMap<String, Vec<UserDevice>>> {
-    if dids.is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    let mut result = HashMap::new();
-
-    // Process in chunks to avoid too many parameters
-    for chunk in dids.chunks(10) {
-        // Create placeholders for SQL IN clause
-        let placeholders: Vec<String> = (1..=chunk.len()).map(|i| format!("${}", i)).collect();
-
-        let query = format!(
-            "SELECT id, did, device_token, created_at, updated_at,
-                    app_attest_key_id,
-                    app_attest_public_key,
-                    app_attest_receipt,
-                    app_attest_counter,
-                    app_attest_challenge,
-                    app_attest_challenge_expires_at,
-                    app_attest_last_verified_at 
-             FROM user_devices 
-             WHERE did IN ({})",
-            placeholders.join(",")
-        );
-
-        // Manually build and execute the query
-        let mut q = sqlx::query(&query);
-        for did in chunk {
-            q = q.bind(did);
-        }
-
-        // Execute the query and process rows
-        let rows = q.fetch_all(pool).await?;
-
-        for row in rows {
-            let device = UserDevice {
-                id: row.get("id"),
-                did: row.get("did"),
-                device_token: row.get("device_token"),
-                created_at: row.get("created_at"),
-                updated_at: row.get("updated_at"),
-                app_attest_key_id: row.get("app_attest_key_id"),
-                app_attest_public_key: row.get("app_attest_public_key"),
-                app_attest_receipt: row.get("app_attest_receipt"),
-                app_attest_counter: row.get::<i64, _>("app_attest_counter"),
-                app_attest_challenge: row.get("app_attest_challenge"),
-                app_attest_challenge_expires_at: row.get("app_attest_challenge_expires_at"),
-                app_attest_last_verified_at: row.get("app_attest_last_verified_at"),
-            };
-
-            result
-                .entry(device.did.clone())
-                .or_insert_with(Vec::new)
-                .push(device);
-        }
-    }
-
-    Ok(result)
-}
-
-pub async fn get_notification_preferences(
-    pool: &Pool<Postgres>,
-    user_id: uuid::Uuid,
-) -> Result<NotificationPreference> {
-    let preferences = sqlx::query_as::<_, NotificationPreference>(
-        r#"
-        SELECT
-            user_id,
-            mentions,
-            replies,
-            likes,
-            follows,
-            reposts,
-            quotes,
-            via_likes,
-            via_reposts,
-            activity_subscriptions
-        FROM notification_preferences
-        WHERE user_id = $1
-        "#,
-    )
-    .bind(user_id)
-    .fetch_one(pool)
-    .await?;
-
-    Ok(preferences)
-}
-
-pub async fn get_notification_preferences_batch(
-    pool: &Pool<Postgres>,
-    user_ids: &[uuid::Uuid],
-) -> Result<HashMap<uuid::Uuid, NotificationPreference>> {
-    if user_ids.is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    let mut result = HashMap::new();
-
-    // Process in chunks to avoid too many parameters
-    for chunk in user_ids.chunks(10) {
-        let placeholders: Vec<String> = (1..=chunk.len()).map(|i| format!("${}", i)).collect();
-
-        let query = format!(
-            "SELECT user_id, mentions, replies, likes, follows, reposts, quotes, 
-                    via_likes, via_reposts, activity_subscriptions
-             FROM notification_preferences 
-             WHERE user_id IN ({})",
-            placeholders.join(",")
-        );
-
-        let mut q = sqlx::query(&query);
-        for user_id in chunk {
-            q = q.bind(user_id);
-        }
-
-        let rows = q.fetch_all(pool).await?;
-
-        for row in rows {
-            let preference = NotificationPreference {
-                user_id: row.get("user_id"),
-                mentions: row.get("mentions"),
-                replies: row.get("replies"),
-                likes: row.get("likes"),
-                follows: row.get("follows"),
-                reposts: row.get("reposts"),
-                quotes: row.get("quotes"),
-                via_likes: row.get("via_likes"),
-                via_reposts: row.get("via_reposts"),
-                activity_subscriptions: row.get("activity_subscriptions"),
-            };
-
-            result.insert(preference.user_id, preference);
-        }
-    }
-
-    Ok(result)
+pub async fn get_registered_users(pool: &Pool<Postgres>) -> Result<Vec<String>> {
+    let rows = sqlx::query("SELECT DISTINCT did FROM user_devices WHERE is_active = TRUE")
+        .fetch_all(pool)
+        .await?;
+    Ok(rows.iter().map(|r| r.get("did")).collect())
 }
 
 pub async fn get_last_cursor(pool: &Pool<Postgres>) -> Result<Option<String>> {
@@ -213,35 +69,29 @@ pub async fn get_last_cursor(pool: &Pool<Postgres>) -> Result<Option<String>> {
 }
 
 pub async fn update_cursor(pool: &Pool<Postgres>, cursor: &str) -> Result<()> {
-    // Check if a cursor exists
-    let exists = sqlx::query!("SELECT COUNT(*) as count FROM firehose_cursor")
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM firehose_cursor")
         .fetch_one(pool)
-        .await?
-        .count
-        .unwrap_or(0)
-        > 0;
+        .await?;
 
-    if exists {
-        // Update existing cursor
-        sqlx::query!(
+    if count > 0 {
+        sqlx::query(
             r#"
             UPDATE firehose_cursor
             SET cursor = $1, updated_at = NOW()
             WHERE id = (SELECT id FROM firehose_cursor ORDER BY id DESC LIMIT 1)
             "#,
-            cursor
         )
+        .bind(cursor)
         .execute(pool)
         .await?;
     } else {
-        // Insert new cursor if none exists
-        sqlx::query!(
+        sqlx::query(
             r#"
             INSERT INTO firehose_cursor (cursor, updated_at)
             VALUES ($1, NOW())
             "#,
-            cursor
         )
+        .bind(cursor)
         .execute(pool)
         .await?;
     }
@@ -249,76 +99,30 @@ pub async fn update_cursor(pool: &Pool<Postgres>, cursor: &str) -> Result<()> {
     Ok(())
 }
 
-pub async fn get_registered_users(pool: &Pool<Postgres>) -> Result<Vec<String>> {
-    let users = sqlx::query!(
-        r#"
-        SELECT DISTINCT did FROM user_devices
-        "#
-    )
-    .fetch_all(pool)
-    .await?
-    .into_iter()
-    .map(|row| row.did)
-    .collect();
-
-    Ok(users)
-}
-
 pub async fn cleanup_old_cursors(pool: &Pool<Postgres>, days_to_keep: i32) -> Result<()> {
-    sqlx::query!(
+    sqlx::query(
         r#"
         DELETE FROM firehose_cursor
         WHERE updated_at < NOW() - INTERVAL '1 day' * $1
         AND id NOT IN (SELECT id FROM firehose_cursor ORDER BY updated_at DESC LIMIT 1)
         "#,
-        days_to_keep as f64
     )
+    .bind(days_to_keep as f64)
     .execute(pool)
     .await?;
 
     Ok(())
 }
 
-pub async fn list_activity_subscriptions_for_subscriber(
-    pool: &Pool<Postgres>,
-    subscriber_did: &str,
-) -> Result<Vec<ActivitySubscription>> {
-    let subscriptions = sqlx::query_as::<_, ActivitySubscription>(
-        r#"
-        SELECT
-            id,
-            subscriber_did,
-            subject_did,
-            include_posts,
-            include_replies,
-            created_at,
-            updated_at
-        FROM activity_subscriptions
-        WHERE subscriber_did = $1
-        ORDER BY subject_did
-        "#,
-    )
-    .bind(subscriber_did)
-    .fetch_all(pool)
-    .await?;
-
-    Ok(subscriptions)
-}
-
-pub async fn list_activity_subscribers_for_subject(
+/// Get activity subscribers for a given subject DID.
+/// Returns (subscriber_did, include_posts, include_replies).
+pub async fn get_activity_subscribers(
     pool: &Pool<Postgres>,
     subject_did: &str,
-) -> Result<Vec<ActivitySubscription>> {
-    let subscriptions = sqlx::query_as::<_, ActivitySubscription>(
+) -> Result<Vec<(String, bool, bool)>> {
+    let rows = sqlx::query(
         r#"
-        SELECT
-            id,
-            subscriber_did,
-            subject_did,
-            include_posts,
-            include_replies,
-            created_at,
-            updated_at
+        SELECT subscriber_did, include_posts, include_replies
         FROM activity_subscriptions
         WHERE subject_did = $1
         "#,
@@ -327,50 +131,53 @@ pub async fn list_activity_subscribers_for_subject(
     .fetch_all(pool)
     .await?;
 
-    Ok(subscriptions)
+    Ok(rows
+        .iter()
+        .map(|r| {
+            (
+                r.get::<String, _>("subscriber_did"),
+                r.get::<bool, _>("include_posts"),
+                r.get::<bool, _>("include_replies"),
+            )
+        })
+        .collect())
 }
 
-pub async fn upsert_activity_subscription(
+/// Enqueue an event into nest's push_event_queue for delivery.
+pub async fn enqueue_push_event(
     pool: &Pool<Postgres>,
-    subscriber_did: &str,
-    subject_did: &str,
-    include_posts: bool,
-    include_replies: bool,
+    recipient_did: &str,
+    actor_did: &str,
+    notification_type: &str,
+    event_cid: &str,
+    event_path: &str,
+    subject_uri: Option<&str>,
+    thread_root_uri: Option<&str>,
+    event_record_json: &serde_json::Value,
+    event_timestamp: i64,
+    dedupe_key: &str,
 ) -> Result<()> {
     sqlx::query(
         r#"
-        INSERT INTO activity_subscriptions (subscriber_did, subject_did, include_posts, include_replies)
-        VALUES ($1, $2, $3, $4)
-        ON CONFLICT (subscriber_did, subject_did)
-        DO UPDATE
-        SET include_posts = EXCLUDED.include_posts,
-            include_replies = EXCLUDED.include_replies,
-            updated_at = NOW()
+        INSERT INTO push_event_queue (
+            recipient_did, actor_did, notification_type,
+            event_cid, event_path, subject_uri, thread_root_uri,
+            event_record_json, event_timestamp, dedupe_key
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        ON CONFLICT (dedupe_key) DO NOTHING
         "#,
     )
-    .bind(subscriber_did)
-    .bind(subject_did)
-    .bind(include_posts)
-    .bind(include_replies)
-    .execute(pool)
-    .await?;
-
-    Ok(())
-}
-
-pub async fn delete_activity_subscription(
-    pool: &Pool<Postgres>,
-    subscriber_did: &str,
-    subject_did: &str,
-) -> Result<()> {
-    sqlx::query(
-        r#"
-        DELETE FROM activity_subscriptions
-        WHERE subscriber_did = $1 AND subject_did = $2
-        "#,
-    )
-    .bind(subscriber_did)
-    .bind(subject_did)
+    .bind(recipient_did)
+    .bind(actor_did)
+    .bind(notification_type)
+    .bind(event_cid)
+    .bind(event_path)
+    .bind(subject_uri)
+    .bind(thread_root_uri)
+    .bind(event_record_json)
+    .bind(event_timestamp)
+    .bind(dedupe_key)
     .execute(pool)
     .await?;
 
