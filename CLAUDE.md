@@ -66,79 +66,19 @@ The application requires these environment variables:
 
 ## Deployment
 
-### Systemd Services
-The application is deployed using systemd services for automatic restart and service management:
+Two systemd services: `bluesky-push-notifier-stg` (port 8080) and `bluesky-push-notifier-dev` (port 8081).
 
-#### Service 1 - Staging (STG)
-- **Service**: `bluesky-push-notifier-stg.service`
-- **Port**: 8080
-- **Config**: `stg` (Doppler)
-- **Command**: `doppler run --config stg -- /home/ubuntu/bluesky-push-notifier/target/release/bluesky-push-notifier`
-- **Domain**: notifications.catbird.blue (production domain)
-- **Management**:
-  - Start: `sudo systemctl start bluesky-push-notifier-stg`
-  - Stop: `sudo systemctl stop bluesky-push-notifier-stg`
-  - Restart: `sudo systemctl restart bluesky-push-notifier-stg`
-  - Status: `sudo systemctl status bluesky-push-notifier-stg`
-  - Logs: `sudo journalctl -u bluesky-push-notifier-stg -f`
-
-#### Service 2 - Development (DEV)
-- **Service**: `bluesky-push-notifier-dev.service`
-- **Port**: 8081
-- **Config**: `dev` (Doppler)
-- **Command**: `doppler run --config dev -- /home/ubuntu/bluesky-push-notifier/target/release/bluesky-push-notifier`
-- **Domain**: dev.notifications.catbird.blue
-- **Management**:
-  - Start: `sudo systemctl start bluesky-push-notifier-dev`
-  - Stop: `sudo systemctl stop bluesky-push-notifier-dev`
-  - Restart: `sudo systemctl restart bluesky-push-notifier-dev`
-  - Status: `sudo systemctl status bluesky-push-notifier-dev`
-  - Logs: `sudo journalctl -u bluesky-push-notifier-dev -f`
-
-### Deployment Process
-After building a new version, deploy by restarting the systemd services:
 ```bash
-# Build the release binary
 cargo build --release
 
-# Restart DEV service first for testing
+# Deploy DEV first, then STG if stable
 sudo systemctl restart bluesky-push-notifier-dev
-
-# Check logs and verify it's working
 sudo journalctl -u bluesky-push-notifier-dev -f
 
-# If DEV looks good, restart STG
 sudo systemctl restart bluesky-push-notifier-stg
-
-# Verify STG
 sudo journalctl -u bluesky-push-notifier-stg -f
 ```
 
-### Nginx Configurations
+Secrets managed via Doppler (configs: `dev`, `stg`, `prd`). Never hardcode credentials.
 
-#### Production: notifications.catbird.blue
-- **Config File**: `/etc/nginx/sites-available/notifications.catbird.blue`
-- **Proxy Target**: `http://localhost:8080` (STG service)
-
-#### Development: dev.notifications.catbird.blue  
-- **Config File**: `/etc/nginx/sites-available/dev.notifications.catbird.blue`
-- **Backup Config**: `/etc/nginx/sites-available/dev.notifications.catbird.blue.backup`
-- **Proxy Target**: `http://localhost:8081` (DEV service)
-
-### Health Status
-- **Port 8080** (STG): ✅ Healthy
-- **Port 8081** (DEV): ✅ Healthy
-
-### Doppler Configurations
-
-Available configs in `bluesky-push-notifier` project:
-- **dev**: Development environment (actively used)
-- **dev_personal**: Personal development environment (unused)
-- **stg**: Staging environment (actively used)
-- **prd**: Production environment (available but not currently deployed)
-
-### Summary
-- ✅ 2 healthy services running on ports 8080 (STG) and 8081 (DEV)
-- ✅ Both services have proper nginx reverse proxy configurations
-- ✅ Both services are using Doppler for environment configuration
-- 📝 Production config exists but not currently deployed
+**Note:** This is the predecessor to `catbird-firehose`, which refactored the monolith into a modular workspace.
